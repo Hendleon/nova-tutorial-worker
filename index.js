@@ -15,7 +15,7 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-07-03-nova-flags-v1";
+const WORKER_VERSION = "2026-07-03-mascot-required-v3";
 
 if (!WORKER_API_URL || !TUTORIAL_WORKER_TOKEN) {
   console.error("Missing required env vars. See .env.example");
@@ -54,36 +54,123 @@ const requireSelector = (step, index) => {
   return step.selector;
 };
 
-const clickSelector = async (page, selector) => {
-  const locator = page.locator(selector).first();
-  await locator.waitFor({ state: "attached", timeout: 15000 });
-  await locator.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(250);
-
-  try {
-    await locator.click({ timeout: 5000 });
-    return;
-  } catch (firstError) {
-    const message = String(firstError?.message ?? firstError);
-    if (!message.includes("not stable") && !message.includes("detached") && !message.includes("Timeout")) {
-      throw firstError;
+const splitSelectorList = (selector) => {
+  const parts = [];
+  let current = "";
+  let quote = null;
+  let depth = 0;
+  for (const ch of String(selector ?? "")) {
+    if (quote) {
+      current += ch;
+      if (ch === quote) quote = null;
+      continue;
     }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      current += ch;
+      continue;
+    }
+    if (ch === "(") depth += 1;
+    if (ch === ")") depth = Math.max(0, depth - 1);
+    if (ch === "," && depth === 0) {
+      if (current.trim()) parts.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  if (current.trim()) parts.push(current.trim());
+  return parts.length ? parts : [selector];
+};
+
+const extractHasText = (selector) => {
+  const out = [];
+  const re = /:has-text\(("([^"]+)"|'([^']+)')\)/g;
+  let match;
+  while ((match = re.exec(String(selector ?? "")))) out.push(match[2] ?? match[3]);
+  return out;
+};
+
+const clickVisibleText = async (page, text) => page.evaluate((needle) => {
+  const normalizedNeedle = String(needle ?? "").trim().toLowerCase();
+  if (!normalizedNeedle) return false;
+  const visible = (element) => {
+    const style = window.getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+  };
+  const candidates = Array.from(document.querySelectorAll("button, [role='button'], a, input, textarea, [data-tour], [tabindex], div, span"));
+  const target = candidates.find((element) => {
+    const label = [
+      element.textContent,
+      element.getAttribute("aria-label"),
+      element.getAttribute("title"),
+      element.getAttribute("placeholder"),
+    ].filter(Boolean).join(" ").trim().toLowerCase();
+    return label.includes(normalizedNeedle) && visible(element);
+  });
+  if (!target) return false;
+  const clickable = target.closest("button, [role='button'], a, input, textarea, [tabindex], [data-tour]") ?? target;
+  clickable.scrollIntoView({ block: "center", inline: "center" });
+  clickable.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true, view: window }));
+  clickable.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
+  clickable.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window }));
+  clickable.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+  return true;
+}, text).catch(() => false);
+
+const clickSelector = async (page, selector, options = {}) => {
+  const selectors = splitSelectorList(selector);
+  let lastError = null;
+
+  for (const candidate of selectors) {
+    const locator = page.locator(candidate).first();
+    const found = await locator.waitFor({ state: "attached", timeout: options.timeout ?? 5000 }).then(() => true).catch((error) => {
+      lastError = error;
+      return false;
+    });
+    if (!found) continue;
+
+    await locator.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(250);
+
+    try {
+      await locator.click({ timeout: 5000 });
+      return true;
+    } catch (firstError) {
+      lastError = firstError;
+      const message = String(firstError?.message ?? firstError);
+      if (!message.includes("not stable") && !message.includes("detached") && !message.includes("Timeout")) {
+        continue;
+      }
+    }
+
+    await page.waitForTimeout(500);
+    const clicked = await page.evaluate((sel) => {
+      let element = null;
+      try { element = document.querySelector(sel); } catch { return false; }
+      if (!element) return false;
+      element.scrollIntoView({ block: "center", inline: "center" });
+      if (element instanceof HTMLElement) {
+        element.click();
+        return true;
+      }
+      element.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+      return true;
+    }, candidate);
+    if (clicked) return true;
   }
 
-  await page.waitForTimeout(500);
-  await page.waitForSelector(selector, { state: "attached", timeout: 10000 });
-  const clicked = await page.evaluate((sel) => {
-    const element = document.querySelector(sel);
-    if (!element) return false;
-    element.scrollIntoView({ block: "center", inline: "center" });
-    if (element instanceof HTMLElement) {
-      element.click();
-      return true;
-    }
-    element.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
-    return true;
-  }, selector);
-  if (!clicked) throw new Error(`selector not found after retry: ${selector}`);
+  for (const text of extractHasText(selector)) {
+    if (await clickVisibleText(page, text)) return true;
+  }
+
+  if (options.optional) {
+    console.log(`[recording] optional click target not found, continuing: ${selector}`);
+    return false;
+  }
+
+  throw new Error(`selector not found after retry: ${selector}${lastError ? ` (${String(lastError.message ?? lastError).split("\n")[0]})` : ""}`);
 };
 
 const fillSelector = async (page, selector, text) => {
@@ -91,6 +178,33 @@ const fillSelector = async (page, selector, text) => {
   await locator.waitFor({ state: "attached", timeout: 15000 });
   await locator.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
   await locator.fill(text ?? "", { timeout: 10000 });
+};
+
+const ensureRouteForClick = async (page, selector, nova) => {
+  const sel = String(selector ?? "");
+  const route = sel.includes("profile-alex") || /has-text\(["']Alex["']\)/.test(sel)
+    ? "/profiles"
+    : sel.includes("Type your message") || sel.includes("Send message") || sel.includes("Text Chat")
+      ? "/chat"
+      : sel.includes("Meltdown") || sel.includes("Elopement") || sel.includes("Wandering")
+        ? "/crisis"
+        : null;
+  if (!route) return;
+  const current = new URL(page.url()).pathname;
+  if (current === route) return;
+  const url = new URL(`${nova.app_url}${route}`);
+  url.searchParams.set("demo", "1");
+  url.searchParams.set("recording", "1");
+  url.searchParams.set("skipOnboarding", "1");
+  url.searchParams.set("lang", "en");
+  console.log(`[recording] selector implies ${route}; navigating before click`);
+  await page.goto(url.toString(), { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+};
+
+const isSafeOptionalClick = (selector) => {
+  const sel = String(selector ?? "");
+  return sel.includes("profile-alex") || /has-text\(["']Alex["']\)/.test(sel);
 };
 
 const novaOrigin = (nova) => new URL(nova.app_url).origin;
@@ -409,9 +523,11 @@ const uploadSidecar = async (flowId, ext, contentType, body) => {
 
 const runScript = async (page, script, nova, narrationMap) => {
   // Skip any autologin goto steps at the head of the script.
-  const steps = script.filter((step) => !(step.action === "goto" && String(step.url ?? "").includes("autologin=")));
-  if (!steps.length || (steps[0].action !== "goto" && steps[0].action !== "narrate")) {
-    steps.unshift({ action: "goto", url: "/" });
+  const steps = script
+    .map((step, originalIndex) => ({ step, originalIndex }))
+    .filter(({ step }) => !(step.action === "goto" && String(step.url ?? "").includes("autologin=")));
+  if (!steps.length || (steps[0].step.action !== "goto" && steps[0].step.action !== "narrate")) {
+    steps.unshift({ step: { action: "goto", url: "/" }, originalIndex: -1 });
   }
 
   // Pair each narrate step with the following non-narrate steps; after those
@@ -419,7 +535,8 @@ const runScript = async (page, script, nova, narrationMap) => {
   // This is the "screen waits for mascot" strategy.
   let currentNarration = null; // { durationMs, startedAt }
 
-  for (const [index, step] of steps.entries()) {
+  for (const [index, item] of steps.entries()) {
+    const { step, originalIndex } = item;
     try {
       if (step.action === "narrate") {
         // Close out any previous narration group first (pad if steps ran short).
@@ -428,7 +545,7 @@ const runScript = async (page, script, nova, narrationMap) => {
           const remaining = currentNarration.durationMs - elapsed;
           if (remaining > 0) await page.waitForTimeout(remaining);
         }
-        const narr = (narrationMap || []).find((n) => n.stepIndex === index);
+        const narr = (narrationMap || []).find((n) => n.stepIndex === originalIndex || n.stepIndex === index);
         currentNarration = narr
           ? { durationMs: narr.durationMs, startedAt: Date.now() }
           : null;
@@ -445,18 +562,49 @@ const runScript = async (page, script, nova, narrationMap) => {
         for (const [k, v] of Object.entries(recorderFlags)) {
           if (!u.searchParams.has(k)) u.searchParams.set(k, v);
         }
+        // Preselect the Alex demo profile so /chat and /profiles land ready to record.
+        if ((u.pathname.startsWith("/chat") || u.pathname.startsWith("/profiles")) && !u.searchParams.has("profile")) {
+          u.searchParams.set("profile", "alex");
+        }
         url = u.toString();
         await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
         await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
         console.log("[recording] opened", page.url());
       } else if (step.action === "click") {
-        await clickSelector(page, requireSelector(step, index));
+        const selector = requireSelector(step, originalIndex >= 0 ? originalIndex : index);
+        await ensureRouteForClick(page, selector, nova);
+        await clickSelector(page, selector, { optional: isSafeOptionalClick(selector), timeout: 7000 });
       } else if (step.action === "type") {
-        await fillSelector(page, requireSelector(step, index), interpolate(step.text, nova));
+        await fillSelector(page, requireSelector(step, originalIndex >= 0 ? originalIndex : index), interpolate(step.text, nova));
       } else if (step.action === "wait") {
         await page.waitForTimeout(step.ms ?? 500);
+      } else if (step.action === "waitForChatReply") {
+        // Wait for a new assistant chat bubble to appear so Nova's response
+        // is on camera before the next step runs.
+        const timeout = step.timeoutMs ?? 20000;
+        const holdMs = step.holdMs ?? 2000;
+        const baseline = await page.evaluate(() => {
+          const candidates = document.querySelectorAll(
+            "[data-role='assistant'], [data-message-role='assistant'], [data-tour='chat-message-assistant'], .assistant-message, .nova-message, [data-nova-role='assistant']",
+          );
+          return candidates.length;
+        }).catch(() => 0);
+        const grew = await page.waitForFunction(
+          (base) => {
+            const candidates = document.querySelectorAll(
+              "[data-role='assistant'], [data-message-role='assistant'], [data-tour='chat-message-assistant'], .assistant-message, .nova-message, [data-nova-role='assistant']",
+            );
+            return candidates.length > base;
+          },
+          baseline,
+          { timeout },
+        ).then(() => true).catch(() => false);
+        if (!grew) {
+          console.log(`[recording] chat reply not detected within ${timeout}ms, holding anyway`);
+        }
+        await page.waitForTimeout(holdMs);
       } else if (step.action === "zoomTo") {
-        const selector = requireSelector(step, index);
+        const selector = requireSelector(step, originalIndex >= 0 ? originalIndex : index);
         const locator = page.locator(selector).first();
         await locator.waitFor({ state: "attached", timeout: 15000 });
         await locator.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
@@ -478,7 +626,8 @@ const runScript = async (page, script, nova, narrationMap) => {
         throw new Error(`unknown action: ${step.action}`);
       }
     } catch (e) {
-      throw new Error(`${stepLabel(index, step)} failed: ${String(e?.message ?? e).split("\n")[0]}`);
+      const labelIndex = originalIndex >= 0 ? originalIndex : index;
+      throw new Error(`${stepLabel(labelIndex, step)} failed: ${String(e?.message ?? e).split("\n")[0]}`);
     }
   }
 
@@ -491,6 +640,9 @@ const runScript = async (page, script, nova, narrationMap) => {
 };
 
 const processFlow = async ({ flow, nova }) => {
+  if (!flow.mascot_url) {
+    throw new Error("no mascot_url provided; Nova must appear on screen in every tutorial");
+  }
   const workDir = await mkdtemp(join(tmpdir(), `flow-${flow.id}-`));
   const recordingMp4 = join(workDir, "recording.mp4");
   const compositedPath = join(workDir, "composited.mp4");
