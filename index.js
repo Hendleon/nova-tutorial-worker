@@ -3,7 +3,6 @@
 // composites the mascot MP4 with ffmpeg, uploads the final 9:16 MP4, and reports back.
 
 import { chromium } from "playwright";
-import { createClient } from "@supabase/supabase-js";
 import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -13,17 +12,13 @@ import fetch from "node-fetch";
 const {
   WORKER_API_URL,
   TUTORIAL_WORKER_TOKEN,
-  SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY,
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-if (!WORKER_API_URL || !TUTORIAL_WORKER_TOKEN || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+if (!WORKER_API_URL || !TUTORIAL_WORKER_TOKEN) {
   console.error("Missing required env vars. See .env.example");
   process.exit(1);
 }
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 
 const api = async (body) => {
   const res = await fetch(WORKER_API_URL, {
@@ -52,7 +47,6 @@ const runScript = async (page, script) => {
 
 const processFlow = async ({ flow, nova }) => {
   const workDir = await mkdtemp(join(tmpdir(), `flow-${flow.id}-`));
-  const recordingPath = join(workDir, "recording.webm");
   const recordingMp4 = join(workDir, "recording.mp4");
   const compositedPath = join(workDir, "composited.mp4");
   const mascotPath = join(workDir, "mascot.mp4");
@@ -109,18 +103,18 @@ const processFlow = async ({ flow, nova }) => {
     await sh("ffmpeg", ["-y", "-i", recordingMp4, "-c", "copy", compositedPath]);
   }
 
-  // 4. Upload
+  // 4. Get a signed upload URL from the edge function, then upload the video
+  const { uploadUrl, viewUrl } = await api({ action: "getUploadUrl", id: flow.id, ext: "mp4" });
   const buf = await readFile(compositedPath);
-  const key = `flow-${flow.id}-${Date.now()}.mp4`;
-  const { error: upErr } = await supabase.storage.from("nova-tutorials").upload(key, buf, {
-    contentType: "video/mp4",
-    upsert: true,
+  const upRes = await fetch(uploadUrl, {
+    method: "PUT",
+    headers: { "content-type": "video/mp4" },
+    body: buf,
   });
-  if (upErr) throw upErr;
-  const { data: signed } = await supabase.storage.from("nova-tutorials").createSignedUrl(key, 60 * 60 * 24 * 30);
+  if (!upRes.ok) throw new Error(`storage upload ${upRes.status}: ${await upRes.text()}`);
 
   await rm(workDir, { recursive: true, force: true });
-  return { composited_url: signed.signedUrl, recording_url: null };
+  return { composited_url: viewUrl, recording_url: null };
 };
 
 const loop = async () => {
@@ -128,6 +122,7 @@ const loop = async () => {
     try {
       const { flow, nova } = await api({ action: "claim" });
       if (!flow) {
+        console.log("[loop] no work, sleeping…");
         await new Promise((r) => setTimeout(r, Number(POLL_INTERVAL_MS)));
         continue;
       }
