@@ -15,7 +15,7 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-07-03-mascot-image-fallback-v4";
+const WORKER_VERSION = "2026-07-03-mascot-url-robust-v5";
 
 if (!WORKER_API_URL || !TUTORIAL_WORKER_TOKEN) {
   console.error("Missing required env vars. See .env.example");
@@ -736,7 +736,13 @@ const processFlow = async ({ flow, nova }) => {
   let mascotInputIdx = -1;
 
   if (flow.mascot_url) {
-    const mascotBuf = await (await fetch(flow.mascot_url)).arrayBuffer();
+    const rawUrl = String(flow.mascot_url).trim();
+    let absoluteUrl = rawUrl;
+    if (!rawUrl.startsWith("http://") && !rawUrl.startsWith("https://")) {
+      if (rawUrl.startsWith("/")) absoluteUrl = `${nova.app_url.replace(/\/+$/, "")}${rawUrl}`;
+      else throw new Error(`mascot_url is not a valid fetchable URL: ${rawUrl}`);
+    }
+    const mascotBuf = await (await fetch(absoluteUrl)).arrayBuffer();
     await writeFile(mascotPath, Buffer.from(mascotBuf));
     mascotInputIdx = inputs.length / 2; // after -y placeholder trick, count -i entries
     inputs.push("-i", mascotPath);
