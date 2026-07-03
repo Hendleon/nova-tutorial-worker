@@ -8,7 +8,7 @@
     "postinstall": "playwright install --with-deps chromium"
   },
   "dependencies": {
-    "playwright": "^1.47.0",
+    "playwright": "^1.61.1",
     "node-fetch": "^3.3.2"
   },
   "engines": {
