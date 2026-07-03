@@ -15,7 +15,7 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-07-03-mascot-url-robust-v5";
+const WORKER_VERSION = "2026-07-03-mascot-small-bottom-left-v6";
 
 if (!WORKER_API_URL || !TUTORIAL_WORKER_TOKEN) {
   console.error("Missing required env vars. See .env.example");
@@ -656,7 +656,7 @@ const processFlow = async ({ flow, nova }) => {
   const narrationMap = await preloadNarration(flow.script || []);
   console.log(`[narrate] preloaded ${narrationMap.length} segments`);
 
-  // Concat all narration MP3s in order → single narration track that will play
+  // Concat all narration MP3s in order â†’ single narration track that will play
   // over the final composite. Since the recorder paces each group to match the
   // audio length (screen waits for mascot), concatenating with no gaps stays
   // in sync with the recorded visuals.
@@ -766,10 +766,13 @@ const processFlow = async ({ flow, nova }) => {
   }
 
   if (mascotIdx >= 0) {
-    filterParts.push(`[${mascotIdx}:v]scale=iw*0.4:-1[m]`);
-    // For a looped image, don't use shortest=1 on overlay (recording drives length via -shortest at end).
+    // Mascot as a small corner overlay (bottom-LEFT) on top of the screen recording.
+    // Scale relative to the base recording width (~22%) using scale2ref so a huge
+    // source PNG/MP4 does not cover the screen.
+    filterParts.push(`[${mascotIdx}:v][${recIdx}:v]scale2ref=w=iw*0.22:h=ow/mdar[m][base]`);
     const overlaySuffix = mascotIsImage ? "" : ":shortest=1";
-    filterParts.push(`[${recIdx}:v][m]overlay=W-w-20:H-h-160${overlaySuffix}[vout]`);
+    // 20px left margin, 160px bottom margin (keep clear of TikTok-style captions).
+    filterParts.push(`[base][m]overlay=20:H-h-160${overlaySuffix}[vout]`);
     videoLabel = "[vout]";
   } else {
     filterParts.push(`[${recIdx}:v]null[vout]`);
@@ -820,7 +823,7 @@ const loop = async () => {
     try {
       const { flow, nova } = await api({ action: "claim" });
       if (!flow) {
-        console.log("[loop] no work, sleeping…");
+        console.log("[loop] no work, sleepingâ€¦");
         await new Promise((r) => setTimeout(r, Number(POLL_INTERVAL_MS)));
         continue;
       }
