@@ -51,15 +51,13 @@ const processFlow = async ({ flow, nova }) => {
   const compositedPath = join(workDir, "composited.mp4");
   const mascotPath = join(workDir, "mascot.mp4");
 
-  // 1. Log into the demo account
   const loginRes = await fetch(nova.demo_login_url, { method: "POST", headers: { "x-seed-token": nova.seed_token } });
   if (!loginRes.ok) throw new Error(`demo-login ${loginRes.status}`);
   const { access_token } = await loginRes.json();
 
-  // 2. Launch Playwright, restore session, record
   const browser = await chromium.launch();
   const context = await browser.newContext({
-    viewport: { width: 390, height: 844 }, // 9:16 mobile
+    viewport: { width: 390, height: 844 },
     deviceScaleFactor: 2,
     recordVideo: { dir: workDir, size: { width: 390, height: 844 } },
   });
@@ -68,7 +66,6 @@ const processFlow = async ({ flow, nova }) => {
   const page = await context.newPage();
   await page.goto(nova.app_url);
   await page.evaluate((token) => {
-    // Store token where the Nova app expects it. Adjust key if needed.
     localStorage.setItem("nova.access_token", token);
   }, access_token);
 
@@ -80,13 +77,11 @@ const processFlow = async ({ flow, nova }) => {
     await browser.close();
   }
 
-  // Playwright names the video with a hash; grab the first .webm in workDir
   const { readdir } = await import("node:fs/promises");
   const webm = (await readdir(workDir)).find((f) => f.endsWith(".webm"));
   if (!webm) throw new Error("no recording captured");
   await sh("ffmpeg", ["-y", "-i", join(workDir, webm), "-c:v", "libx264", "-pix_fmt", "yuv420p", recordingMp4]);
 
-  // 3. Composite with mascot (bottom-right, 25% width, TikTok safe zone)
   if (flow.mascot_url) {
     const mascotBuf = await (await fetch(flow.mascot_url)).arrayBuffer();
     await writeFile(mascotPath, Buffer.from(mascotBuf));
@@ -103,7 +98,6 @@ const processFlow = async ({ flow, nova }) => {
     await sh("ffmpeg", ["-y", "-i", recordingMp4, "-c", "copy", compositedPath]);
   }
 
-  // 4. Get a signed upload URL from the edge function, then upload the video
   const { uploadUrl, viewUrl } = await api({ action: "getUploadUrl", id: flow.id, ext: "mp4" });
   const buf = await readFile(compositedPath);
   const upRes = await fetch(uploadUrl, {
