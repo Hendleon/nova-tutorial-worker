@@ -15,7 +15,7 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-07-03-mascot-required-v3";
+const WORKER_VERSION = "2026-07-03-mascot-image-fallback-v4";
 
 if (!WORKER_API_URL || !TUTORIAL_WORKER_TOKEN) {
   console.error("Missing required env vars. See .env.example");
@@ -646,7 +646,9 @@ const processFlow = async ({ flow, nova }) => {
   const workDir = await mkdtemp(join(tmpdir(), `flow-${flow.id}-`));
   const recordingMp4 = join(workDir, "recording.mp4");
   const compositedPath = join(workDir, "composited.mp4");
-  const mascotPath = join(workDir, "mascot.mp4");
+  const mascotIsImage = !!flow.mascot_is_image || /\.(png|jpe?g|webp|gif)(\?|$)/i.test(flow.mascot_url || "");
+  const mascotExt = mascotIsImage ? (flow.mascot_url.match(/\.(png|jpe?g|webp|gif)/i)?.[0] || ".png") : ".mp4";
+  const mascotPath = join(workDir, `mascot${mascotExt}`);
   const narrationMp3 = join(workDir, "narration.mp3");
 
   // 0. Pre-generate all narration audio BEFORE opening the browser, so pacing
@@ -750,11 +752,18 @@ const processFlow = async ({ flow, nova }) => {
   const audioIdx = hasNarration ? (flow.mascot_url ? 2 : 1) : -1;
 
   const ffArgs = ["-y"];
-  for (const f of inputFiles) ffArgs.push("-i", f);
+  for (let i = 0; i < inputFiles.length; i += 1) {
+    const f = inputFiles[i];
+    // Loop still-image mascot so it lasts as long as the recording.
+    if (i === mascotIdx && mascotIsImage) ffArgs.push("-loop", "1", "-framerate", "30");
+    ffArgs.push("-i", f);
+  }
 
   if (mascotIdx >= 0) {
     filterParts.push(`[${mascotIdx}:v]scale=iw*0.4:-1[m]`);
-    filterParts.push(`[${recIdx}:v][m]overlay=W-w-20:H-h-160:shortest=1[vout]`);
+    // For a looped image, don't use shortest=1 on overlay (recording drives length via -shortest at end).
+    const overlaySuffix = mascotIsImage ? "" : ":shortest=1";
+    filterParts.push(`[${recIdx}:v][m]overlay=W-w-20:H-h-160${overlaySuffix}[vout]`);
     videoLabel = "[vout]";
   } else {
     filterParts.push(`[${recIdx}:v]null[vout]`);
@@ -781,6 +790,7 @@ const processFlow = async ({ flow, nova }) => {
     ffArgs.push("-map", `${audioIdx}:a`, "-c:a", "aac", "-b:a", "192k", "-shortest");
   } else {
     ffArgs.push("-an");
+    if (mascotIsImage) ffArgs.push("-shortest");
   }
   ffArgs.push("-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", compositedPath);
   await sh("ffmpeg", ffArgs);
