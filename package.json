@@ -9,11 +9,9 @@
   },
   "dependencies": {
     "playwright": "^1.47.0",
-    "node-fetch": "^3.3.2",
-    "@supabase/supabase-js": "^2.45.0"
+    "node-fetch": "^3.3.2"
   },
   "engines": {
     "node": ">=20"
   }
 }
-
