@@ -1,0 +1,19 @@
+{
+  "name": "nova-tutorial-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "postinstall": "playwright install --with-deps chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.47.0",
+    "node-fetch": "^3.3.2",
+    "@supabase/supabase-js": "^2.45.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
+
