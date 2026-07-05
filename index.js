@@ -15,7 +15,7 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-07-03-mascot-small-bottom-left-v6";
+const WORKER_VERSION = "2026-07-05-soft-fail-v9";
 
 if (!WORKER_API_URL || !TUTORIAL_WORKER_TOKEN) {
   console.error("Missing required env vars. See .env.example");
@@ -163,6 +163,34 @@ const clickSelector = async (page, selector, options = {}) => {
 
   for (const text of extractHasText(selector)) {
     if (await clickVisibleText(page, text)) return true;
+  }
+
+  // Last-ditch: for the chat mode picker, click any visible button whose label
+  // contains "text" or "type" when we're on /chat. Handles unknown labels.
+  const selStr = String(selector ?? "");
+  if (/chat-text|Text Chat|chat-mode/i.test(selStr)) {
+    const clicked = await page.evaluate(() => {
+      const url = location.pathname;
+      if (!url.startsWith("/chat")) return false;
+      const btns = Array.from(document.querySelectorAll("button, [role='button']"))
+        .filter((b) => {
+          const r = b.getBoundingClientRect();
+          const s = window.getComputedStyle(b);
+          return r.width > 0 && r.height > 0 && s.visibility !== "hidden" && s.display !== "none";
+        });
+      const target = btns.find((b) => {
+        const label = ((b.innerText || "") + " " + (b.getAttribute("aria-label") || "")).toLowerCase();
+        return /\b(text|type|message|keyboard)\b/.test(label) && !/voice|speak|mic/.test(label);
+      });
+      if (!target) return false;
+      target.scrollIntoView({ block: "center" });
+      target.click();
+      return true;
+    }).catch(() => false);
+    if (clicked) {
+      console.log("[recording] clicked chat mode via label heuristic");
+      return true;
+    }
   }
 
   if (options.optional) {
@@ -436,6 +464,7 @@ const warmUpStorageState = async ({ browser, nova, loginPayload }) => {
 };
 
 const prepareRecordedPage = async ({ browser, workDir, storageState, nova, loginPayload }) => {
+  const recordingStartedAt = Date.now();
   const context = await browser.newContext({
     viewport: { width: 390, height: 844 },
     deviceScaleFactor: 2,
@@ -444,7 +473,7 @@ const prepareRecordedPage = async ({ browser, workDir, storageState, nova, login
   });
   await installStartupState(context, nova, loginPayload);
   const page = await context.newPage();
-  return { context, page };
+  return { context, page, recordingStartedAt };
 };
 
 // Fetch narration MP3 for a `narrate` step via the tutorial-worker edge fn.
@@ -520,15 +549,40 @@ const uploadSidecar = async (flowId, ext, contentType, body) => {
   return viewUrl;
 };
 
+const normalizeScriptSteps = (script) => {
+  const mapped = (script || []).map((step, originalIndex) => ({ step, originalIndex }));
+  const out = [];
+  let skippedAutologin = false;
+
+  for (const item of mapped) {
+    const { step } = item;
+    const isAutologinGoto = step.action === "goto" && String(step.url ?? "").includes("autologin=");
+    if (isAutologinGoto) {
+      skippedAutologin = true;
+      continue;
+    }
+
+    // When the off-camera autologin goto is stripped, also strip its paired
+    // app-ready waits. Otherwise a multi-feature script can sit on a blank or
+    // static prep frame for 10 to 15 seconds before the first real feature.
+    if (skippedAutologin && step.action === "waitForEvent" && step.event === "nova:app-ready") continue;
+    if (skippedAutologin && step.action === "wait" && (step.ms ?? 0) <= 2500) {
+      skippedAutologin = false;
+      continue;
+    }
+
+    skippedAutologin = false;
+    out.push(item);
+  }
+
+  if (!out.length || (out[0].step.action !== "goto" && out[0].step.action !== "narrate")) {
+    out.unshift({ step: { action: "goto", url: "/" }, originalIndex: -1 });
+  }
+  return out;
+};
 
 const runScript = async (page, script, nova, narrationMap) => {
-  // Skip any autologin goto steps at the head of the script.
-  const steps = script
-    .map((step, originalIndex) => ({ step, originalIndex }))
-    .filter(({ step }) => !(step.action === "goto" && String(step.url ?? "").includes("autologin=")));
-  if (!steps.length || (steps[0].step.action !== "goto" && steps[0].step.action !== "narrate")) {
-    steps.unshift({ step: { action: "goto", url: "/" }, originalIndex: -1 });
-  }
+  const steps = normalizeScriptSteps(script);
 
   // Pair each narrate step with the following non-narrate steps; after those
   // run, pad so the group lasts at least as long as the narration audio.
@@ -567,13 +621,23 @@ const runScript = async (page, script, nova, narrationMap) => {
           u.searchParams.set("profile", "alex");
         }
         url = u.toString();
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-        await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
-        console.log("[recording] opened", page.url());
+        if (page.url() === url) {
+          console.log("[recording] already on", page.url());
+        } else {
+          await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+          await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+          console.log("[recording] opened", page.url());
+        }
       } else if (step.action === "click") {
         const selector = requireSelector(step, originalIndex >= 0 ? originalIndex : index);
         await ensureRouteForClick(page, selector, nova);
-        await clickSelector(page, selector, { optional: isSafeOptionalClick(selector), timeout: 7000 });
+        await clickSelector(page, selector, { optional: isSafeOptionalClick(selector), timeout: 4000 });
+        // After Text Chat click, confirm the chat input actually rendered.
+        if (/chat-text|Text Chat/i.test(String(selector))) {
+          const ok = await page.locator('[data-tour="chat-input"], [data-recorder="chat-input"], textarea').first()
+            .waitFor({ state: "visible", timeout: 8000 }).then(() => true).catch(() => false);
+          if (!ok) throw new Error("Text Chat click succeeded but chat input never rendered");
+        }
       } else if (step.action === "type") {
         await fillSelector(page, requireSelector(step, originalIndex >= 0 ? originalIndex : index), interpolate(step.text, nova));
       } else if (step.action === "wait") {
@@ -627,7 +691,16 @@ const runScript = async (page, script, nova, narrationMap) => {
       }
     } catch (e) {
       const labelIndex = originalIndex >= 0 ? originalIndex : index;
-      throw new Error(`${stepLabel(labelIndex, step)} failed: ${String(e?.message ?? e).split("\n")[0]}`);
+      const msg = String(e?.message ?? e).split("\n")[0];
+      // Soft-fail: log the failed step and keep going. The pre-generated
+      // narration audio plays through regardless; a missing selector or a
+      // transient wait failure should never kill the whole render.
+      // The only hard-fail is a `goto` that couldn't even reach a URL, since
+      // downstream steps can't recover from being on the wrong page.
+      if (step.action === "goto") {
+        throw new Error(`${stepLabel(labelIndex, step)} failed: ${msg}`);
+      }
+      console.log(`[recording] SKIP ${stepLabel(labelIndex, step)} failed: ${msg}`);
     }
   }
 
@@ -639,12 +712,18 @@ const runScript = async (page, script, nova, narrationMap) => {
   }
 };
 
+const stage = (name, extra = "") => console.log(`\n===== [stage:${name}] ${extra} =====`);
+
 const processFlow = async ({ flow, nova }) => {
+  const flowStart = Date.now();
+  console.log(`\n########## Processing flow ${flow.id} (${flow.name}) ##########`);
   if (!flow.mascot_url) {
     throw new Error("no mascot_url provided; Nova must appear on screen in every tutorial");
   }
+  stage("mascot-source", `${flow.mascot_is_image ? "image" : "MP4"} ${flow.mascot_url.slice(0, 100)}`);
   const workDir = await mkdtemp(join(tmpdir(), `flow-${flow.id}-`));
   const recordingMp4 = join(workDir, "recording.mp4");
+  const fullRecordingMp4 = join(workDir, "recording-full.mp4");
   const compositedPath = join(workDir, "composited.mp4");
   const mascotIsImage = !!flow.mascot_is_image || /\.(png|jpe?g|webp|gif)(\?|$)/i.test(flow.mascot_url || "");
   const mascotExt = mascotIsImage ? (flow.mascot_url.match(/\.(png|jpe?g|webp|gif)/i)?.[0] || ".png") : ".mp4";
@@ -653,10 +732,11 @@ const processFlow = async ({ flow, nova }) => {
 
   // 0. Pre-generate all narration audio BEFORE opening the browser, so pacing
   // during recording doesn't depend on any network round-trip.
+  stage("narration-preload", `${(flow.script || []).filter((s) => s.action === "narrate").length} lines`);
   const narrationMap = await preloadNarration(flow.script || []);
   console.log(`[narrate] preloaded ${narrationMap.length} segments`);
 
-  // Concat all narration MP3s in order â†’ single narration track that will play
+  // Concat all narration MP3s in order → single narration track that will play
   // over the final composite. Since the recorder paces each group to match the
   // audio length (screen waits for mascot), concatenating with no gaps stays
   // in sync with the recorded visuals.
@@ -690,9 +770,11 @@ const processFlow = async ({ flow, nova }) => {
     }
   }
 
+  stage("browser-launch");
   const browser = await chromium.launch();
 
   // 1. Reuse the initialized demo account state between renders.
+  stage("auth-warmup");
   let loginPayload = await fetchDemoLoginPayload(nova, !cachedNovaStorageState || !isCacheFresh(cachedNovaStorageStateAt));
   let storageState = cachedNovaStorageState && isCacheFresh(cachedNovaStorageStateAt)
     ? cachedNovaStorageState
@@ -706,10 +788,38 @@ const processFlow = async ({ flow, nova }) => {
   }
 
   // 2. Open a fresh RECORDED context using that warmed-up state.
-  const { context, page } = await prepareRecordedPage({ browser, workDir, storageState, nova, loginPayload });
+  stage("recording-start", `${(flow.script || []).length} script steps`);
+  const { context, page, recordingStartedAt } = await prepareRecordedPage({ browser, workDir, storageState, nova, loginPayload });
+  let scriptStartedAt = recordingStartedAt;
+
+  // Prep-navigate to Nova home BEFORE any narration plays, so the first frames
+  // of the final recording show the app, not about:blank. Playwright starts
+  // recording at newPage(), so this prep segment is trimmed before compositing.
+  let prepOk = false;
+  try {
+    await page.setContent(`<!doctype html><html><body style="margin:0;background:#050816;color:#e5e7eb;font:16px system-ui;display:grid;place-items:center;height:100vh"><div>Nova is getting ready</div></body></html>`).catch(() => {});
+    const prepUrl = `${nova.app_url.replace(/\/+$/, "")}/?demo=1&recording=1&skipOnboarding=1&lang=en&profile=alex`;
+    console.log("[recording] prep-navigate", prepUrl);
+    await page.goto(prepUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
+    await page.waitForLoadState("networkidle", { timeout: 3000 }).catch(() => {});
+    prepOk = await page.locator("body").waitFor({ state: "visible", timeout: 3000 }).then(() => true).catch(() => false);
+  } catch (e) {
+    console.log("[recording] prep-navigate failed:", String(e?.message ?? e).split("\n")[0]);
+  }
+  if (!prepOk || page.url() === "about:blank") throw new Error("Nova prep navigation did not render before recording started");
+  scriptStartedAt = Date.now();
+  const preRollMs = Math.max(0, scriptStartedAt - recordingStartedAt);
+  console.log(`[recording] preroll before script ${preRollMs}ms`);
 
   try {
     await runScript(page, flow.script, nova, narrationMap);
+    if (await detectLanguageGate(page)) {
+      cachedNovaStorageState = null;
+      cachedNovaStorageStateAt = 0;
+      cachedNovaLoginPayload = null;
+      cachedNovaLoginPayloadAt = 0;
+      throw new Error("recording started on the language picker instead of an initialized Nova session");
+    }
     if (await detectLanguageGate(page)) {
       cachedNovaStorageState = null;
       cachedNovaStorageStateAt = 0;
@@ -722,11 +832,20 @@ const processFlow = async ({ flow, nova }) => {
     await context.close();
     await browser.close();
   }
+  stage("recording-done");
 
   const { readdir } = await import("node:fs/promises");
   const webm = (await readdir(workDir)).find((f) => f.endsWith(".webm"));
   if (!webm) throw new Error("no recording captured");
-  await sh("ffmpeg", ["-y", "-i", join(workDir, webm), "-c:v", "libx264", "-pix_fmt", "yuv420p", recordingMp4]);
+  stage("transcode-webm-to-mp4");
+  await sh("ffmpeg", ["-y", "-i", join(workDir, webm), "-c:v", "libx264", "-pix_fmt", "yuv420p", fullRecordingMp4]);
+  const trimStartSec = Math.max(0, Math.min(preRollMs, 45000) / 1000).toFixed(3);
+  if (Number(trimStartSec) > 0.05) {
+    stage("trim-recording-preroll", `${trimStartSec}s`);
+    await sh("ffmpeg", ["-y", "-ss", trimStartSec, "-i", fullRecordingMp4, "-c:v", "libx264", "-pix_fmt", "yuv420p", recordingMp4]);
+  } else {
+    await sh("ffmpeg", ["-y", "-i", fullRecordingMp4, "-c", "copy", recordingMp4]);
+  }
 
   // 3. Single-pass composite: screen recording (base) + mascot overlay (bottom-right,
   // TikTok safe zone) + narration audio track. One final MP4, everything synced.
@@ -802,9 +921,11 @@ const processFlow = async ({ flow, nova }) => {
     if (mascotIsImage) ffArgs.push("-shortest");
   }
   ffArgs.push("-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", compositedPath);
+  stage("compositing", `mascot=${mascotIdx >= 0} narration=${hasNarration}`);
   await sh("ffmpeg", ffArgs);
 
   // 4. Upload the final composite.
+  stage("upload-final-mp4");
   const { uploadUrl, viewUrl } = await api({ action: "getUploadUrl", id: flow.id, ext: "mp4" });
   const buf = await readFile(compositedPath);
   const upRes = await fetch(uploadUrl, {
@@ -815,6 +936,7 @@ const processFlow = async ({ flow, nova }) => {
   if (!upRes.ok) throw new Error(`storage upload ${upRes.status}: ${await upRes.text()}`);
 
   await rm(workDir, { recursive: true, force: true });
+  stage("finished", `${Math.round((Date.now() - flowStart) / 1000)}s total`);
   return { composited_url: viewUrl, recording_url: null, captions_srt_url: captionsSrtUrl, captions_vtt_url: captionsVttUrl };
 };
 
@@ -823,7 +945,7 @@ const loop = async () => {
     try {
       const { flow, nova } = await api({ action: "claim" });
       if (!flow) {
-        console.log("[loop] no work, sleepingâ€¦");
+        console.log("[loop] no work, sleeping…");
         await new Promise((r) => setTimeout(r, Number(POLL_INTERVAL_MS)));
         continue;
       }
