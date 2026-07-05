@@ -15,7 +15,7 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-07-05-step-report-v10";
+const WORKER_VERSION = "2026-07-05-audio-gate-v11";
 
 if (!WORKER_API_URL || !TUTORIAL_WORKER_TOKEN) {
   console.error("Missing required env vars. See .env.example");
@@ -593,6 +593,20 @@ const runScript = async (page, script, nova, narrationMap) => {
   for (const [index, item] of steps.entries()) {
     const { step, originalIndex } = item;
     try {
+      // v11 AUDIO GATE: before ANY non-narrate step, wait for the current
+      // narration line's audio to finish playing. Prevents the browser from
+      // navigating/clicking mid-sentence, which was the "screens lagging
+      // behind the script" symptom in v10.
+      if (step.action !== "narrate" && currentNarration) {
+        const elapsed = Date.now() - currentNarration.startedAt;
+        const remaining = currentNarration.durationMs - elapsed;
+        if (remaining > 0) {
+          console.log(`[gate] holding ${remaining}ms for narration to finish before ${step.action}`);
+          await page.waitForTimeout(remaining);
+        }
+        currentNarration = null;
+      }
+
       if (step.action === "narrate") {
         // Close out any previous narration group first (pad if steps ran short).
         if (currentNarration) {
