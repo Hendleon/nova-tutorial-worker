@@ -1,5 +1,5 @@
 # Playwright image already has Chromium + system deps + ffmpeg-friendly base
-FROM mcr.microsoft.com/playwright:v1.61.1-jammy
+FROM mcr.microsoft.com/playwright:v1.62.1-jammy
 
 # Install ffmpeg for compositing
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
