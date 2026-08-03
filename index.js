@@ -15,7 +15,7 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-08-04-silent-scenes-v31-d8e9f0a";
+const WORKER_VERSION = "2026-08-04-verified-cta-v32-e9f0a1b";
 const NARRATION_TAIL_MS = 800;
 
 // ---------------------------------------------------------------------------
@@ -1060,8 +1060,14 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
     activeScene = null;
     await capture.stop();
     if (scene) {
-      scene.framePaths = capture.frames.slice();
-      scene.frameTimes = (capture.frameTimes ?? []).slice();
+      const isClosingCta = scene.screenActionId?.startsWith("cta.")
+        || String(scene.expectedUrl ?? "").includes("/promo-cta");
+      // Chrome can emit a stale screencast frame from the document that was
+      // open before a cross-route navigation. The CTA is a static closing
+      // screen, so its verified post-navigation screenshot is the source of
+      // truth and must not be replaced by stale frames from the prior scene.
+      scene.framePaths = isClosingCta ? [scene.imagePath] : capture.frames.slice();
+      scene.frameTimes = isClosingCta ? [] : (capture.frameTimes ?? []).slice();
       scene.frameIntervalMs = SCENE_FRAME_INTERVAL_MS;
       console.log(`SCENE_FRAMES index=${scene.index} frames=${scene.framePaths.length}`);
     }
