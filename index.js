@@ -1505,7 +1505,10 @@ const processFlow = async ({ flow, nova }) => {
   // v28: captions are ON by default and positioned inside the selected platform's
   // safe zone (see CAPTION_SAFE_ZONES). Set BURN_CAPTIONS=0 to disable burning;
   // the .srt/.vtt sidecars are uploaded either way.
-  const burnCaptions = /^(1|true|yes|on)$/i.test(String(process.env.BURN_CAPTIONS ?? "1"));
+const burnCaptions = flow.burn_captions === false
+  ? false
+  : /^(1|true|yes|on)$/i.test(String(process.env.BURN_CAPTIONS ?? "1"));
+
   if (hasNarration && burnCaptions) {
     // ffmpeg subtitles filter path escaping: escape :, ', \
     const esc = srtPath.replace(/\\/g, "\\\\").replace(/:/g, "\\:").replace(/'/g, "\\'");
