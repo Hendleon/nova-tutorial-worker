@@ -15,7 +15,7 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-08-04-verified-cta-v32-e9f0a1b";
+const WORKER_VERSION = "2026-08-04-nova-handshake-v33-f0a1b2c";
 const NARRATION_TAIL_MS = 800;
 
 // ---------------------------------------------------------------------------
@@ -821,13 +821,13 @@ const writeSceneVideo = async ({ workDir, scenes, outputPath }) => {
 // stalls canvas/WebGL animations. Falls back to the screenshot loop if the CDP
 // session is unavailable. Frame timestamps are recorded so playback uses real
 // per-frame timing.
-const startScreenshotLoopCapture = (page, dir, intervalMs, frames, frameTimes, state) => {
+const startScreenshotLoopCapture = (page, dir, intervalMs, frames, frameTimes, state, prefix = "f") => {
   const startedAt = Date.now();
   return (async () => {
     let i = frames.length;
     while (!state.stopped) {
       const tick = Date.now();
-      const framePath = join(dir, `f-${String(i).padStart(5, "0")}.jpg`);
+      const framePath = join(dir, `${prefix}-${String(i).padStart(5, "0")}.jpg`);
       try {
         const buf = await page.screenshot({ type: "jpeg", quality: 80, fullPage: false, timeout: 4000, animations: "allow" });
         const tmpPath = `${framePath}.tmp`;
@@ -884,6 +884,12 @@ const startFrameCapture = (page, dir, intervalMs = SCENE_FRAME_INTERVAL_MS) => {
         maxHeight: 844,
         everyNthFrame: 1,
       });
+      // CDP only emits when Chrome believes the page has visual damage. Canvas,
+      // WebGL, and throttled headless tabs can therefore go quiet even while an
+      // activity should still be moving. A low-rate screenshot watchdog forces
+      // fresh paints and supplies recovery frames without replacing the smooth
+      // screencast stream.
+      loopRun = startScreenshotLoopCapture(page, dir, 500, frames, frameTimes, state, "watch");
     } catch (e) {
       console.warn(`[capture] screencast unavailable, falling back to screenshot loop: ${String(e).slice(0, 120)}`);
       session = null;
@@ -903,6 +909,10 @@ const startFrameCapture = (page, dir, intervalMs = SCENE_FRAME_INTERVAL_MS) => {
         await session.detach().catch(() => {});
       }
       if (loopRun) await loopRun.catch(() => {});
+      const ordered = frames.map((path, index) => ({ path, at: frameTimes[index] ?? 0 }))
+        .sort((a, b) => a.at - b.at);
+      frames.splice(0, frames.length, ...ordered.map((entry) => entry.path));
+      frameTimes.splice(0, frameTimes.length, ...ordered.map((entry) => entry.at));
     },
   };
 };
@@ -1140,6 +1150,11 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
             scene_check: check,
           });
           if (!check.ok) {
+            const isClosingCta = String(check.screenActionId ?? "").startsWith("cta.")
+              || String(check.expectedUrl ?? "").includes("/promo-cta");
+            if (isClosingCta) {
+              throw new Error(`Closing CTA validation failed: ${check.error ?? "CTA page was not ready"}; expected=${expectedUrl}; actual=${actualUrl}`);
+            }
             // v25/v26: soft validation. The scene is dropped, its narration time
             // is absorbed by the neighbouring scenes, and the render continues.
             console.warn(`SCENE_SOFT_SKIP feature="${check.feature}" reason="${check.error}" expected=${expectedUrl} actual=${actualUrl}`);
@@ -1233,7 +1248,8 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
       } else if (step.action === "click") {
         const selector = requireSelector(step, originalIndex >= 0 ? originalIndex : index);
         await ensureRouteForClick(page, selector, nova);
-        await clickSelector(page, selector, { optional: true, timeout: 4000 });
+        const clicked = await clickSelector(page, selector, { optional: step.critical === false, timeout: 6000 });
+        if (!clicked && step.critical !== false) throw new Error(`required click target was not found: ${selector}`);
         // After Text Chat click, confirm the chat input actually rendered.
         if (/chat-text|Text Chat/i.test(String(selector))) {
           const ok = await page.locator('[data-tour="chat-input"], [data-recorder="chat-input"], textarea').first()
@@ -1580,6 +1596,16 @@ const processFlow = async ({ flow, nova }) => {
     console.warn(`SCENE_COUNT_MISMATCH flow=${flow.id} captured=${stepReport.scenes.length} spoken=${spokenBeats}`);
   }
 
+  const finalScene = stepReport.scenes[stepReport.scenes.length - 1];
+  const finalIsCta = !!finalScene && (
+    String(finalScene.screenActionId ?? "").startsWith("cta.")
+    || String(finalScene.expectedUrl ?? "").includes("/promo-cta")
+    || String(finalScene.url ?? "").includes("/promo-cta")
+  );
+  if (!finalIsCta) {
+    throw new Error(`Closing CTA was not captured as the final scene. Final scene was ${finalScene?.url ?? "missing"}.`);
+  }
+
   stageWithProgress(flow.id, "all-scenes-approved", `${stepReport.scenes.length} screens ready`);
   const scenesByStep = new Map(stepReport.scenes.map((scene) => [scene.stepIndex, scene]));
   for (const scene of stepReport.scenes) scene.durationMs = 0;
@@ -1788,6 +1814,7 @@ const processFlow = async ({ flow, nova }) => {
 
   const publicStepReport = {
     ...stepReport,
+    recorder_plan: flow.recorder_plan ?? null,
     scene_count: stepReport.scenes?.length ?? 0,
     scenes: (stepReport.scenes ?? []).map((scene, index) => ({
       index,
