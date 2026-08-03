@@ -15,7 +15,7 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-08-04-nova-handshake-v33-f0a1b2c";
+const WORKER_VERSION = "2026-08-04-nova-handshake-v34-a7c31d9";
 const NARRATION_TAIL_MS = 800;
 
 // ---------------------------------------------------------------------------
@@ -1133,9 +1133,13 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
             screenActionId: step.screenActionId ?? null,
             expectedUrl,
             actualUrl,
-            ok: routeOk && stable,
+            // v34: route match is the only hard requirement. Animation-heavy
+            // Calm tools never reach a "visually stable" signature, so treating
+            // instability as a failure dropped every good scene.
+            ok: routeOk,
+            unstable: routeOk && !stable,
             empty_state: emptyState,
-            error: !routeOk ? "Expected Nova route was not open" : !stable ? "Screen did not become visually stable" : null,
+            error: !routeOk ? "Expected Nova route was not open" : null,
           };
           stepReport.scene_checks.push(check);
           if (emptyState) {
@@ -1248,8 +1252,18 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
       } else if (step.action === "click") {
         const selector = requireSelector(step, originalIndex >= 0 ? originalIndex : index);
         await ensureRouteForClick(page, selector, nova);
-        const clicked = await clickSelector(page, selector, { optional: step.critical === false, timeout: 6000 });
-        if (!clicked && step.critical !== false) throw new Error(`required click target was not found: ${selector}`);
+        const clicked = await clickSelector(page, selector, { optional: true, timeout: 6000 });
+        if (!clicked) {
+          // v34: a missing click target is reported but never aborts the beat.
+          // Hard-failing here in v33 left the page mid-beat and cascaded into
+          // every following scene failing route validation.
+          stepReport.skipped.push({
+            action: "click",
+            caption: step.caption ?? null,
+            error: `click target was not found: ${selector}`,
+          });
+          console.warn(`CLICK_SOFT_SKIP selector=${selector}`);
+        }
         // After Text Chat click, confirm the chat input actually rendered.
         if (/chat-text|Text Chat/i.test(String(selector))) {
           const ok = await page.locator('[data-tour="chat-input"], [data-recorder="chat-input"], textarea').first()
