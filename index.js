@@ -15,7 +15,7 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-08-04-nova-handshake-v34-a7c31d9";
+const WORKER_VERSION = "2026-08-04-nova-authoritative-v35-c8e42f1";
 const NARRATION_TAIL_MS = 800;
 
 // ---------------------------------------------------------------------------
@@ -1163,6 +1163,17 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
             // is absorbed by the neighbouring scenes, and the render continues.
             console.warn(`SCENE_SOFT_SKIP feature="${check.feature}" reason="${check.error}" expected=${expectedUrl} actual=${actualUrl}`);
           } else {
+            const isClosingCta = String(check.screenActionId ?? "").startsWith("cta.")
+              || String(check.expectedUrl ?? "").includes("/promo-cta");
+            if (isClosingCta) {
+              const ctaReady = await page.locator('[data-recorder="promo-cta"]').first()
+                .waitFor({ state: "visible", timeout: 10000 })
+                .then(() => true)
+                .catch(() => false);
+              if (!ctaReady) {
+                throw new Error(`Closing CTA URL opened but the CTA screen did not render; actual=${actualUrl}`);
+              }
+            }
             const sceneIndex = stepReport.scenes.length;
             const imagePath = join(sceneWorkDir, `scene-${String(sceneIndex).padStart(3, "0")}.png`);
             await page.screenshot({ path: imagePath, fullPage: false });
@@ -1263,6 +1274,7 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
             error: `click target was not found: ${selector}`,
           });
           console.warn(`CLICK_SOFT_SKIP selector=${selector}`);
+          if (step.critical) throw new Error(`required click target was not found: ${selector}`);
         }
         // After Text Chat click, confirm the chat input actually rendered.
         if (/chat-text|Text Chat/i.test(String(selector))) {
@@ -1431,7 +1443,7 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
       // transient wait failure should never kill the whole render.
       // The only hard-fail is a `goto` that couldn't even reach a URL, since
       // downstream steps can't recover from being on the wrong page.
-      if (step.action === "goto") {
+      if (step.action === "goto" || step.critical) {
         throw new Error(`${stepLabel(labelIndex, step)} failed: ${msg}`);
       }
       console.log(`[recording] SKIP ${stepLabel(labelIndex, step)} failed: ${msg}`);
@@ -1670,16 +1682,25 @@ const processFlow = async ({ flow, nova }) => {
   const sceneRecordingMs = await writeSceneVideo({ workDir, scenes: stepReport.scenes, outputPath: recordingMp4 });
 
   const narrationTrackMs = hasNarration ? await getMediaDurationMs(narrationMp3) : 0;
+  const scenesTotalMs = stepReport.scenes.reduce((sum, scene) => sum + scene.durationMs, 0);
   const narrationEndMs = Math.max(
     narrationTrackMs,
     narrationMap.reduce((max, n) => Math.max(max, (Number.isFinite(n.startMs) ? n.startMs : 0) + n.durationMs), 0),
+    scenesTotalMs,
   );
   const trimmedRecordingMs = sceneRecordingMs || await getMediaDurationMs(recordingMp4);
   // v19: narration is the authoritative clock. Scenes are already assembled to
   // the same per-line durations, then trimmed or padded to the narration tail.
-  const targetVideoMs = hasNarration && narrationEndMs > 0
+  const requestedTargetVideoMs = hasNarration && narrationEndMs > 0
     ? narrationEndMs + NARRATION_TAIL_MS
     : (trimmedRecordingMs > 0 ? trimmedRecordingMs : 0);
+  const finalIsCtaScene = String(finalScene?.screenActionId ?? "").startsWith("cta.")
+    || String(finalScene?.expectedUrl ?? "").includes("/promo-cta");
+  // Never trim the assembled tail when it contains the required CTA. Previous
+  // versions could validate and capture CTA, then remove it here with ffmpeg -t.
+  const targetVideoMs = finalIsCtaScene
+    ? Math.max(requestedTargetVideoMs, trimmedRecordingMs)
+    : requestedTargetVideoMs;
   let baseRecordingMp4 = recordingMp4;
   if (targetVideoMs > 0) {
     const padMs = targetVideoMs - trimmedRecordingMs;
@@ -1806,6 +1827,9 @@ const processFlow = async ({ flow, nova }) => {
   stageWithProgress(flow.id, "compositing", `mascot=${mascotIdx >= 0} narration=${hasNarration}`);
   await sh("ffmpeg", ffArgs);
   const finalVideoMs = await getMediaDurationMs(compositedPath);
+  if (finalIsCtaScene && finalVideoMs + 250 < scenesTotalMs) {
+    throw new Error(`final video may be missing the CTA: final=${finalVideoMs}ms scenes=${scenesTotalMs}ms`);
+  }
   console.warn(`TIMING_REPORT flow=${flow.id} worker=${WORKER_VERSION} narration_track_ms=${narrationTrackMs} narration_clock_ms=${narrationClockMs} target_ms=${targetVideoMs} recording_ms=${trimmedRecordingMs} final_ms=${finalVideoMs}`);
   console.log(`[timing] final=${finalVideoMs}ms target=${targetVideoMs}ms`);
   if (targetVideoMs > 0 && finalVideoMs + 250 < targetVideoMs) {
