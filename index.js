@@ -15,7 +15,7 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-08-04-smooth-capture-v29-f1a2b3c";
+const WORKER_VERSION = "2026-08-04-silent-scenes-v31-d8e9f0a";
 const NARRATION_TAIL_MS = 800;
 
 // ---------------------------------------------------------------------------
@@ -55,7 +55,6 @@ const resolveCaptionZone = (platform) => {
 // v23: every scene is a live frame burst (real motion: taps, animations, menus
 // opening) instead of one frozen screenshot.
 const SCENE_FRAME_INTERVAL_MS = 100;
-const SCENE_MAX_LIVE_MS = 12000;
 
 if (!WORKER_API_URL || !TUTORIAL_WORKER_TOKEN) {
   console.error("Missing required env vars. See .env.example");
@@ -548,6 +547,21 @@ const prepareRecordedPage = async ({ browser, workDir, storageState, nova, login
   return { context, page, recordingStartedAt };
 };
 
+// v30: keeps a headless page's render loop from being throttled. Playwright
+// pages are never OS-focused, so Chrome quietly demotes them to "background
+// tab" behavior (Page.setWebLifecycleState defaults to "frozen"/"hidden"
+// scheduling), which throttles requestAnimationFrame and timers to ~1Hz after
+// a couple of seconds. That is exactly the "records ~3s then freezes" symptom:
+// the screencast has nothing new to send because the page stopped painting.
+const forceActivePage = async (page) => {
+  await page.bringToFront().catch(() => {});
+  const session = await page.context().newCDPSession(page).catch(() => null);
+  if (!session) return;
+  await session.send("Page.setWebLifecycleState", { state: "active" }).catch(() => {});
+  await session.send("Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
+  await session.detach().catch(() => {});
+};
+
 const prepareScenePage = async ({ browser, storageState, nova, loginPayload }) => {
   const context = await browser.newContext({
     viewport: { width: 390, height: 844 },
@@ -558,6 +572,7 @@ const prepareScenePage = async ({ browser, storageState, nova, loginPayload }) =
   });
   await installStartupState(context, nova, loginPayload);
   const page = await context.newPage();
+  await forceActivePage(page);
   return { context, page };
 };
 
@@ -583,7 +598,15 @@ const preloadNarration = async (script, workDir) => {
   const out = [];
   for (let i = 0; i < script.length; i += 1) {
     const s = script[i];
-    if (s.action !== "narrate" || !s.text?.trim()) continue;
+    if (s.action !== "narrate") continue;
+    if (!s.text?.trim()) {
+      const durationMs = Math.max(500, Number(s.ms) || 2500);
+      const probePath = join(workDir, `narr-probe-${i}.mp3`);
+      await createSilenceMp3(probePath, durationMs);
+      const buffer = await readFile(probePath);
+      out.push({ stepIndex: i, durationMs, buffer, text: "" });
+      continue;
+    }
     console.log(`[narrate] generating audio for step ${i + 1}: "${s.text.slice(0, 60)}..."`);
     const audio = await fetchNarrationAudio(s.text);
     const probePath = join(workDir, `narr-probe-${i}.mp3`);
@@ -944,7 +967,7 @@ const normalizeScriptSteps = (script) => {
       let interactionStarted = false;
       for (const entry of before) {
         if (entry.step.action === "goto") interactionStarted = false;
-        if (["click", "type", "zoomTo"].includes(entry.step.action)) interactionStarted = true;
+        if (["click", "type", "zoomTo", "slowScroll", "drawHeart"].includes(entry.step.action)) interactionStarted = true;
         if (interactionStarted) live.push(entry);
         else setup.push(entry);
       }
@@ -1028,7 +1051,7 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
     if (!activeCapture) return;
     if (holdForNarration && currentNarration) {
       const elapsed = Date.now() - currentNarration.startedAt;
-      const remaining = Math.min(SCENE_MAX_LIVE_MS, currentNarration.durationMs - elapsed);
+      const remaining = currentNarration.durationMs - elapsed;
       if (remaining > 0) await page.waitForTimeout(remaining).catch(() => {});
     }
     const capture = activeCapture;
@@ -1139,6 +1162,7 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
             const sceneFrameDir = join(sceneWorkDir, `frames-${String(sceneIndex).padStart(3, "0")}`);
             await mkdir(sceneFrameDir, { recursive: true });
             activeScene = scene;
+            await forceActivePage(page);
             activeCapture = startFrameCapture(page, sceneFrameDir, SCENE_FRAME_INTERVAL_MS);
             console.log(`SCENE_CAPTURE index=${sceneIndex} duration_ms=${scene.durationMs} url=${urlAtSpeak} line="${(step.text ?? "").slice(0, 80)}"`);
             if (flowId) postProgress(flowId, {
@@ -1195,8 +1219,13 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
           const finalPath = (() => { try { return new URL(page.url()).pathname; } catch { return null; } })();
           lastGotoSamePath = !!(currentPath && finalPath && currentPath === finalPath);
           console.log("[recording] opened", page.url(), lastGotoSamePath ? "(same path)" : "");
+          // v30: a fresh document resets Chrome's page lifecycle scheduling,
+          // which is what let the freeze reappear on the 2nd/3rd scene even
+          // after the initial page load was forced active.
+          await forceActivePage(page);
         }
       } else if (step.action === "click") {
+        const selector = requireSelector(step, originalIndex >= 0 ? originalIndex : index);
         await ensureRouteForClick(page, selector, nova);
         await clickSelector(page, selector, { optional: true, timeout: 4000 });
         // After Text Chat click, confirm the chat input actually rendered.
@@ -1234,11 +1263,99 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
           console.log(`[recording] chat reply not detected within ${timeout}ms, holding anyway`);
         }
         await waitWithinBudget(holdMs);
+      } else if (step.action === "slowScroll") {
+        const durationMs = Math.max(1000, step.ms ?? 5000);
+        await page.evaluate(async (duration) => {
+          const root = document.scrollingElement ?? document.documentElement;
+          const maxY = Math.max(0, root.scrollHeight - window.innerHeight);
+          if (maxY <= 0) return;
+          const startY = window.scrollY;
+          const started = performance.now();
+          await new Promise((resolve) => {
+            const tick = (now) => {
+              const progress = Math.min(1, (now - started) / duration);
+              const eased = progress < 0.5 ? 2 * progress * progress : 1 - Math.pow(-2 * progress + 2, 2) / 2;
+              window.scrollTo(0, startY + (maxY - startY) * eased);
+              if (progress < 1) requestAnimationFrame(tick);
+              else resolve();
+            };
+            requestAnimationFrame(tick);
+          });
+        }, durationMs);
+      } else if (step.action === "drawHeart") {
+        const selector = requireSelector(step, originalIndex >= 0 ? originalIndex : index);
+        const target = page.locator(selector).first();
+        await target.waitFor({ state: "visible", timeout: 8000 });
+        const box = await target.boundingBox();
+        if (!box) throw new Error("drawing surface has no visible bounds");
+        const durationMs = Math.max(1200, step.ms ?? 2800);
+        const points = [];
+        for (let i = 0; i <= 72; i += 1) {
+          const t = (Math.PI * 2 * i) / 72;
+          const x = 16 * Math.sin(t) ** 3;
+          const y = 13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t);
+          points.push({
+            x: box.x + box.width * (0.5 + x / 40),
+            y: box.y + box.height * (0.48 - y / 36),
+          });
+        }
+        await page.mouse.move(points[0].x, points[0].y);
+        await page.mouse.down();
+        const delay = Math.max(8, Math.floor(durationMs / points.length));
+        for (const point of points.slice(1)) await page.mouse.move(point.x, point.y, { steps: 1 }).then(() => page.waitForTimeout(delay));
+        await page.mouse.up();
       } else if (step.action === "zoomTo") {
         const selector = requireSelector(step, originalIndex >= 0 ? originalIndex : index);
         const locator = page.locator(selector).first();
         await locator.waitFor({ state: "attached", timeout: 15000 });
         await locator.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+      } else if (step.action === "scroll") {
+        // v30: slow, steppy scroll so the screencast captures real intermediate
+        // frames instead of one instant jump. Scrolls a selector's container if
+        // given, otherwise the window. deltaY/steps/stepDelayMs are tunable per
+        // step so a long feed can scroll slower than a short settings list.
+        const targetSelector = step.selector ?? null;
+        const totalDeltaY = step.deltaY ?? 600;
+        const steps = Math.max(1, step.steps ?? 12);
+        const stepDelayMs = step.stepDelayMs ?? 90;
+        const perStep = totalDeltaY / steps;
+        if (targetSelector) {
+          const locator = page.locator(targetSelector).first();
+          const box = await locator.boundingBox().catch(() => null);
+          if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+        }
+        for (let i = 0; i < steps; i += 1) {
+          if (targetSelector) {
+            await page.evaluate(({ sel, dy }) => {
+              const el = document.querySelector(sel);
+              (el ?? window).scrollBy?.(0, dy) ?? window.scrollBy(0, dy);
+            }, { sel: targetSelector, dy: perStep }).catch(() => {});
+          } else {
+            await page.mouse.wheel(0, perStep).catch(() => {});
+          }
+          await waitWithinBudget(stepDelayMs);
+        }
+      } else if (step.action === "draw") {
+        // v30: simulate a hand drawing/tracing gesture (e.g. sensory draw/sand
+        // canvases) as a real pointer-down + slow multi-point drag + pointer-up
+        // sequence, so the screencast captures the stroke actually being drawn
+        // instead of a single click producing an instant mark.
+        const points = Array.isArray(step.points) ? step.points : [];
+        if (points.length < 2) throw new Error("draw requires at least 2 points");
+        const stepDelayMs = step.stepDelayMs ?? 40;
+        const segmentsPerLeg = Math.max(1, step.segmentsPerLeg ?? 8);
+        await page.mouse.move(points[0].x, points[0].y);
+        await page.mouse.down();
+        for (let i = 1; i < points.length; i += 1) {
+          const from = points[i - 1];
+          const to = points[i];
+          for (let s2 = 1; s2 <= segmentsPerLeg; s2 += 1) {
+            const t = s2 / segmentsPerLeg;
+            await page.mouse.move(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t);
+            await waitWithinBudget(stepDelayMs);
+          }
+        }
+        await page.mouse.up();
       } else if (step.action === "waitForEvent") {
         const event = step.event;
         const timeout = Math.max(250, Math.min(step.ms ?? 15000, remainingBudgetMs() || (step.ms ?? 15000)));
@@ -1357,11 +1474,12 @@ const processFlow = async ({ flow, nova }) => {
   const captionPlatform = String(flow.caption_platform || process.env.CAPTION_PLATFORM || "tiktok").toLowerCase();
   const CAPTION_PRESET = resolveCaptionZone(captionPlatform);
 
-  // Validate and capture every requested Nova screen before generating paid
-  // narration. This stops bad routes and selectors before they consume credits.
-  let narrationMap = [];
-  let narrationClockMs = 0;
-  console.log("[validation] paid narration remains blocked until every requested screen is approved");
+  // Narration duration is required before capture. Without it, scenes only roll
+  // for the fallback 500ms plus interaction waits, then ffmpeg freezes the last
+  // frame for the rest of the spoken line.
+  stageWithProgress(flow.id, "narration-preload", `${flowScript.filter((step) => step.action === "narrate").length} lines`);
+  let narrationMap = await preloadNarration(flowScript, workDir);
+  let narrationClockMs = applyContinuousNarrationTimeline(narrationMap);
 
   // Narration audio is written after recording, using actual per-line start
   // times. If a screen transition runs long, the final audio track gets silence,
@@ -1381,6 +1499,15 @@ const processFlow = async ({ flow, nova }) => {
       "--disable-background-timer-throttling",
       "--disable-renderer-backgrounding",
       "--disable-backgrounding-occluded-windows",
+      // v30: the screencast froze ~3s in because headless pages are never OS-
+      // focused, so Chrome's per-tab "intensive wake up throttling" and
+      // occlusion tracking treat them as backgrounded and cut rAF/timers down
+      // to ~1Hz shortly after load. These flags plus the forced lifecycle
+      // state below (see forceActivePage) are what actually keep the render
+      // loop running for the whole scene, not just the args disabling window
+      // backgrounding above.
+      "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,TranslateUI",
+      "--disable-ipc-flooding-protection",
     ],
   });
 
@@ -1448,10 +1575,6 @@ const processFlow = async ({ flow, nova }) => {
   }
 
   stageWithProgress(flow.id, "all-scenes-approved", `${stepReport.scenes.length} screens ready`);
-  stageWithProgress(flow.id, "narration-preload", `${spokenBeats} lines`);
-  narrationMap = await preloadNarration(flowScript, workDir);
-  narrationClockMs = applyContinuousNarrationTimeline(narrationMap);
-
   const scenesByStep = new Map(stepReport.scenes.map((scene) => [scene.stepIndex, scene]));
   for (const scene of stepReport.scenes) scene.durationMs = 0;
   let lastScene = null;
@@ -1497,7 +1620,6 @@ const processFlow = async ({ flow, nova }) => {
   }
 
   if (!stepReport.scenes.length) throw new Error("no scenes captured from tutorial narration");
-
   stageWithProgress(flow.id, "assemble-scenes", `${stepReport.scenes.length} stills`);
   const sceneRecordingMs = await writeSceneVideo({ workDir, scenes: stepReport.scenes, outputPath: recordingMp4 });
 
