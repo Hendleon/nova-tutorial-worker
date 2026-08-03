@@ -15,8 +15,43 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-08-02-soft-scenes-v25-b7c8d9e";
+const WORKER_VERSION = "2026-08-03-platform-captions-v28-a1b2c3d";
 const NARRATION_TAIL_MS = 800;
+
+// ---------------------------------------------------------------------------
+// v28: platform caption safe zones (all values in real 1080x1920 pixels).
+// Research basis (2026 UI): every vertical platform overlays an engagement
+// column on the RIGHT (~20% of width) and a caption/username strip at the
+// BOTTOM (TikTok/Reels ~25-30%, Shorts ~25%, Facebook Reels ~28%). The top
+// strip carries navigation. Safe area = center / left, upper-to-middle frame.
+// Alignment 2 = bottom-center, 1 = bottom-left (ASS numpad convention).
+// ---------------------------------------------------------------------------
+const CAPTION_FRAME_W = 1080;
+const CAPTION_FRAME_H = 1920;
+const CAPTION_SAFE_ZONES = {
+  // Bottom strip ~29% (555px) + right rail 20% -> sit captions at ~600px up,
+  // shifted left of the engagement column.
+  tiktok: { alignment: 2, marginV: 620, marginL: 80, marginR: 260, fontSize: 52, mascotBottom: 660 },
+  // Reels has the tallest bottom strip (~30%) plus the audio ticker.
+  instagram_reels: { alignment: 2, marginV: 700, marginL: 80, marginR: 280, fontSize: 52, mascotBottom: 740 },
+  instagram: { alignment: 2, marginV: 700, marginL: 80, marginR: 280, fontSize: 52, mascotBottom: 740 },
+  // Facebook Reels: bottom strip ~28%, right rail slightly narrower.
+  facebook_reels: { alignment: 2, marginV: 650, marginL: 80, marginR: 240, fontSize: 52, mascotBottom: 690 },
+  facebook: { alignment: 2, marginV: 650, marginL: 80, marginR: 240, fontSize: 52, mascotBottom: 690 },
+  // Shorts: description + audio attribution eat the bottom ~25%.
+  youtube_shorts: { alignment: 2, marginV: 560, marginL: 80, marginR: 260, fontSize: 52, mascotBottom: 600 },
+  // Long-form YouTube: only the progress bar / controls at the very bottom.
+  youtube: { alignment: 2, marginV: 200, marginL: 90, marginR: 90, fontSize: 54, mascotBottom: 240 },
+  linkedin: { alignment: 2, marginV: 420, marginL: 90, marginR: 200, fontSize: 52, mascotBottom: 460 },
+  x: { alignment: 2, marginV: 420, marginL: 90, marginR: 200, fontSize: 52, mascotBottom: 460 },
+};
+const DEFAULT_CAPTION_ZONE = CAPTION_SAFE_ZONES.tiktok;
+const resolveCaptionZone = (platform) => {
+  const key = String(platform || process.env.CAPTION_PLATFORM || "tiktok")
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+  return CAPTION_SAFE_ZONES[key] || DEFAULT_CAPTION_ZONE;
+};
 // v23: every scene is a live frame burst (real motion: taps, animations, menus
 // opening) instead of one frozen screenshot.
 const SCENE_FRAME_INTERVAL_MS = 100;
@@ -374,6 +409,27 @@ const detectLanguageGate = async (page) => page.evaluate(() => {
   const text = document.body?.innerText ?? "";
   return /Welcome to Nova/i.test(text) && /Choose your language|Elige tu idioma|Choisissez votre langue/i.test(text);
 }).catch(() => false);
+
+// v26: spot screens that are about to be filmed while still empty. Returns the
+// matched phrase (for the warning log) or null when the screen looks lived in.
+const detectEmptyState = async (page) => page.evaluate(() => {
+  const text = (document.body?.innerText ?? "").replace(/\s+/g, " ");
+  const patterns = [
+    /No [a-z ]{0,30}(yet|created|added|saved)/i,
+    /Nothing here yet/i,
+    /You (haven't|have not) [a-z ]{0,40}yet/i,
+    /Create your first [a-z ]{0,30}/i,
+    /Add your first [a-z ]{0,30}/i,
+    /Get started by [a-z ]{0,30}/i,
+    /No results found/i,
+    /Your [a-z ]{0,25} is empty/i,
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match) return match[0].slice(0, 80);
+  }
+  return null;
+}).catch(() => null);
 
 const hasAuthStorage = (state, nova) => Boolean(
   nova.auth_storage_key
@@ -864,7 +920,7 @@ const waitForVisualStability = async (page, timeoutMs = 5000) => {
 
 const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date.now(), recordingBudgetMs = 0, options = {}) => {
   const steps = normalizeScriptSteps(script);
-  const stepReport = { skipped: [], ran: 0, total: steps.length, scenes: [], scene_checks: [], worker_version: WORKER_VERSION };
+  const stepReport = { skipped: [], ran: 0, total: steps.length, scenes: [], scene_checks: [], empty_state_warnings: [], worker_version: WORKER_VERSION };
   const captureScenes = !!options.captureScenes;
   const sceneWorkDir = options.sceneWorkDir;
   const flowId = options.flowId;
@@ -948,6 +1004,10 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
           const actualUrl = (() => { try { return page.url(); } catch { return "unknown"; } })();
           const routeOk = routeMatches(actualUrl, expectedUrl, nova);
           const stable = routeOk ? await waitForVisualStability(page) : false;
+          // v26: warn (never fail) when a screen is about to be filmed while it
+          // is still showing an empty state. Empty screens on camera read as
+          // "nobody uses this app", so we surface which screen needs seeding.
+          const emptyState = routeOk ? await detectEmptyState(page) : null;
           const check = {
             beatId: step.beatId ?? `beat-${stepReport.scenes.length + 1}`,
             feature: step.beatFeature ?? "Scene",
@@ -955,53 +1015,59 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
             expectedUrl,
             actualUrl,
             ok: routeOk && stable,
+            empty_state: emptyState,
             error: !routeOk ? "Expected Nova route was not open" : !stable ? "Screen did not become visually stable" : null,
           };
           stepReport.scene_checks.push(check);
+          if (emptyState) {
+            stepReport.empty_state_warnings.push({ feature: check.feature, url: actualUrl, match: emptyState });
+            console.warn(`SCENE_EMPTY_STATE feature="${check.feature}" url=${actualUrl} match="${emptyState}"`);
+          }
           if (flowId) postProgress(flowId, {
             stage: "scene-validation",
             current: stepReport.scene_checks.length,
             total: totalNarrateSteps,
-            note: `${check.feature} ${check.ok ? "ready" : "failed"}`,
+            note: `${check.feature} ${check.ok ? (emptyState ? "ready (empty state)" : "ready") : "skipped"}`,
             scene_check: check,
           });
           if (!check.ok) {
-            const validationError = new Error(`${check.feature} validation failed: ${check.error}. Expected ${expectedUrl}, got ${actualUrl}`);
-            validationError.stepReport = stepReport;
-            throw validationError;
+            // v25/v26: soft validation. The scene is dropped, its narration time
+            // is absorbed by the neighbouring scenes, and the render continues.
+            console.warn(`SCENE_SOFT_SKIP feature="${check.feature}" reason="${check.error}" expected=${expectedUrl} actual=${actualUrl}`);
+          } else {
+            const sceneIndex = stepReport.scenes.length;
+            const imagePath = join(sceneWorkDir, `scene-${String(sceneIndex).padStart(3, "0")}.png`);
+            await page.screenshot({ path: imagePath, fullPage: false });
+            const scene = {
+              index: sceneIndex,
+              imagePath,
+              framePaths: [],
+              frameIntervalMs: SCENE_FRAME_INTERVAL_MS,
+              durationMs: Math.max(500, narr.durationMs || 0),
+              line: step.text ?? "",
+              url: urlAtSpeak,
+              stepIndex: originalIndex >= 0 ? originalIndex : index,
+              beatId: check.beatId,
+              feature: check.feature,
+              screenActionId: check.screenActionId,
+              expectedUrl: check.expectedUrl,
+              ok: true,
+            };
+            stepReport.scenes.push(scene);
+            // v23: start rolling live frames so the taps/menus/animations that run
+            // under this line end up in the final video instead of a frozen still.
+            const sceneFrameDir = join(sceneWorkDir, `frames-${String(sceneIndex).padStart(3, "0")}`);
+            await mkdir(sceneFrameDir, { recursive: true });
+            activeScene = scene;
+            activeCapture = startFrameCapture(page, sceneFrameDir, SCENE_FRAME_INTERVAL_MS);
+            console.log(`SCENE_CAPTURE index=${sceneIndex} duration_ms=${scene.durationMs} url=${urlAtSpeak} line="${(step.text ?? "").slice(0, 80)}"`);
+            if (flowId) postProgress(flowId, {
+              stage: "scene-capture",
+              current: sceneIndex + 1,
+              total: totalNarrateSteps,
+              note: (step.text ?? "").slice(0, 80),
+            });
           }
-          const sceneIndex = stepReport.scenes.length;
-          const imagePath = join(sceneWorkDir, `scene-${String(sceneIndex).padStart(3, "0")}.png`);
-          await page.screenshot({ path: imagePath, fullPage: false });
-          const scene = {
-            index: sceneIndex,
-            imagePath,
-            framePaths: [],
-            frameIntervalMs: SCENE_FRAME_INTERVAL_MS,
-            durationMs: Math.max(500, narr.durationMs || 0),
-            line: step.text ?? "",
-            url: urlAtSpeak,
-            stepIndex: originalIndex >= 0 ? originalIndex : index,
-            beatId: check.beatId,
-            feature: check.feature,
-            screenActionId: check.screenActionId,
-            expectedUrl: check.expectedUrl,
-            ok: true,
-          };
-          stepReport.scenes.push(scene);
-          // v23: start rolling live frames so the taps/menus/animations that run
-          // under this line end up in the final video instead of a frozen still.
-          const sceneFrameDir = join(sceneWorkDir, `frames-${String(sceneIndex).padStart(3, "0")}`);
-          await mkdir(sceneFrameDir, { recursive: true });
-          activeScene = scene;
-          activeCapture = startFrameCapture(page, sceneFrameDir, SCENE_FRAME_INTERVAL_MS);
-          console.log(`SCENE_CAPTURE index=${sceneIndex} duration_ms=${scene.durationMs} url=${urlAtSpeak} line="${(step.text ?? "").slice(0, 80)}"`);
-          if (flowId) postProgress(flowId, {
-            stage: "scene-capture",
-            current: sceneIndex + 1,
-            total: totalNarrateSteps,
-            note: (step.text ?? "").slice(0, 80),
-          });
         }
         stepReport.ran += 1;
         continue;
@@ -1202,6 +1268,9 @@ const processFlow = async ({ flow, nova }) => {
   const srtPath = join(workDir, "captions.srt");
   const vttPath = join(workDir, "captions.vtt");
   const flowScript = stripLegacyFillerNarration(flow.script || []);
+  // v28: caption + mascot placement follows the target platform's safe zone.
+  const captionPlatform = String(flow.caption_platform || process.env.CAPTION_PLATFORM || "tiktok").toLowerCase();
+  const CAPTION_PRESET = resolveCaptionZone(captionPlatform);
 
   // Validate and capture every requested Nova screen before generating paid
   // narration. This stops bad routes and selectors before they consume credits.
@@ -1421,12 +1490,11 @@ const processFlow = async ({ flow, nova }) => {
   }
 
   if (mascotIdx >= 0) {
-    // Mascot as a small corner overlay (bottom-LEFT) on top of the screen recording.
-    // Scale relative to the base recording width (~22%) using scale2ref so a huge
-    // source PNG/MP4 does not cover the screen.
+    // Mascot as a small corner overlay (bottom-LEFT) on top of the screen recording,
+    // lifted above the platform's bottom caption/username strip.
+    // (v28) bottom offset comes from the platform safe-zone preset.
     filterParts.push(`[${mascotIdx}:v][${recIdx}:v]scale2ref=w=iw*0.22:h=ow/mdar[m][base]`);
-    // 20px left margin, 160px bottom margin (keep clear of TikTok-style captions).
-    filterParts.push(`[base][m]overlay=20:H-h-160[vout]`);
+    filterParts.push(`[base][m]overlay=20:H-h-${CAPTION_PRESET.mascotBottom}[vout]`);
     videoLabel = "[vout]";
   } else {
     filterParts.push(`[${recIdx}:v]null[vout]`);
@@ -1434,12 +1502,23 @@ const processFlow = async ({ flow, nova }) => {
   }
 
   // Burn captions on top of whatever the video chain produced so far.
-  if (hasNarration) {
+  // v28: captions are ON by default and positioned inside the selected platform's
+  // safe zone (see CAPTION_SAFE_ZONES). Set BURN_CAPTIONS=0 to disable burning;
+  // the .srt/.vtt sidecars are uploaded either way.
+  const burnCaptions = /^(1|true|yes|on)$/i.test(String(process.env.BURN_CAPTIONS ?? "1"));
+  if (hasNarration && burnCaptions) {
     // ffmpeg subtitles filter path escaping: escape :, ', \
     const esc = srtPath.replace(/\\/g, "\\\\").replace(/:/g, "\\:").replace(/'/g, "\\'");
-    const style = "FontName=DejaVu Sans,FontSize=14,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=220,Bold=1";
-    filterParts.push(`${videoLabel}subtitles='${esc}':force_style='${style}'[vsub]`);
+    const p = CAPTION_PRESET;
+    const fontSize = Number(process.env.CAPTION_FONT_SIZE || p.fontSize);
+    const marginV = Number(process.env.CAPTION_MARGIN_V || p.marginV);
+    const style = `FontName=DejaVu Sans,FontSize=${fontSize},PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,BorderStyle=1,Outline=3,Shadow=0,Alignment=${p.alignment},MarginV=${marginV},MarginL=${p.marginL},MarginR=${p.marginR},Bold=1`;
+    // original_size pins libass to the real 1080x1920 frame so margins are true pixels
+    // (without it libass assumes 384px-tall script res and margins get multiplied ~5x,
+    //  which is what pushed captions to the top of frame before v28).
+    filterParts.push(`${videoLabel}subtitles='${esc}':original_size=${CAPTION_FRAME_W}x${CAPTION_FRAME_H}:force_style='${style}'[vsub]`);
     videoLabel = "[vsub]";
+    console.log(`[captions] platform=${captionPlatform} align=${p.alignment} marginV=${marginV} font=${fontSize}`);
   }
 
   if (filterParts.length) {
