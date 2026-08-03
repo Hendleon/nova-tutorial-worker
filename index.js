@@ -15,7 +15,7 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-08-03-platform-captions-v28-a1b2c3d";
+const WORKER_VERSION = "2026-08-04-smooth-capture-v29-f1a2b3c";
 const NARRATION_TAIL_MS = 800;
 
 // ---------------------------------------------------------------------------
@@ -551,7 +551,9 @@ const prepareRecordedPage = async ({ browser, workDir, storageState, nova, login
 const prepareScenePage = async ({ browser, storageState, nova, loginPayload }) => {
   const context = await browser.newContext({
     viewport: { width: 390, height: 844 },
-    deviceScaleFactor: 2,
+    // v29: 1x for the captured context. Output is 390x844 anyway, and 2x frames
+    // were starving the animation loop during capture.
+    deviceScaleFactor: 1,
     storageState,
   });
   await installStartupState(context, nova, loginPayload);
@@ -739,22 +741,37 @@ const writeSceneVideo = async ({ workDir, scenes, outputPath }) => {
     const targetMs = Math.max(500, scene.durationMs);
     const frames = (scene.framePaths ?? []).length ? scene.framePaths : [scene.imagePath];
     const intervalMs = scene.frameIntervalMs ?? SCENE_FRAME_INTERVAL_MS;
-    const realMs = frames.length * intervalMs;
+    const times = Array.isArray(scene.frameTimes) && scene.frameTimes.length === frames.length ? scene.frameTimes : null;
     if (frames.length === 1) {
       lines.push(concatFileLine(frames[0]));
       lines.push(`duration ${(targetMs / 1000).toFixed(3)}`);
-    } else if (realMs <= targetMs) {
-      // Real-time playback, then hold the final frame to fill the spoken line.
-      const tailMs = targetMs - realMs + intervalMs;
+    } else if (times) {
+      // Real per-frame timing from the screencast. Scale to fit the spoken line:
+      // stretch the tail when capture was short, compress evenly when it ran long.
+      const raw = frames.map((_, i) => Math.max(20, (i === frames.length - 1 ? targetMs : times[i + 1]) - times[i]));
+      const realMs = raw.reduce((a, b) => a + b, 0);
+      const scale = realMs > targetMs ? targetMs / realMs : 1;
+      const durations = raw.map((ms) => ms * scale);
+      if (realMs < targetMs) durations[durations.length - 1] += targetMs - realMs;
       frames.forEach((file, i) => {
         lines.push(concatFileLine(file));
-        lines.push(`duration ${(((i === frames.length - 1 ? tailMs : intervalMs)) / 1000).toFixed(3)}`);
+        lines.push(`duration ${(durations[i] / 1000).toFixed(3)}`);
       });
     } else {
-      const per = targetMs / frames.length;
-      for (const file of frames) {
-        lines.push(concatFileLine(file));
-        lines.push(`duration ${(per / 1000).toFixed(3)}`);
+      const realMs = frames.length * intervalMs;
+      if (realMs <= targetMs) {
+        // Real-time playback, then hold the final frame to fill the spoken line.
+        const tailMs = targetMs - realMs + intervalMs;
+        frames.forEach((file, i) => {
+          lines.push(concatFileLine(file));
+          lines.push(`duration ${(((i === frames.length - 1 ? tailMs : intervalMs)) / 1000).toFixed(3)}`);
+        });
+      } else {
+        const per = targetMs / frames.length;
+        for (const file of frames) {
+          lines.push(concatFileLine(file));
+          lines.push(`duration ${(per / 1000).toFixed(3)}`);
+        }
       }
     }
     lastFile = frames[frames.length - 1];
@@ -776,35 +793,97 @@ const writeSceneVideo = async ({ workDir, scenes, outputPath }) => {
   return getMediaDurationMs(outputPath);
 };
 
-// Continuously screenshot the live page into `dir` until stopped. Failures
-// (page mid-navigation, busy renderer) are ignored so capture never breaks a run.
-const startFrameCapture = (page, dir, intervalMs = SCENE_FRAME_INTERVAL_MS) => {
-  const frames = [];
-  let stopped = false;
-  const run = (async () => {
-    let i = 0;
-    while (!stopped) {
-      const startedAt = Date.now();
+// v29: capture through the Chrome DevTools screencast so frames arrive as the
+// page actually paints (25-30 fps) instead of a 10 fps screenshot loop that
+// stalls canvas/WebGL animations. Falls back to the screenshot loop if the CDP
+// session is unavailable. Frame timestamps are recorded so playback uses real
+// per-frame timing.
+const startScreenshotLoopCapture = (page, dir, intervalMs, frames, frameTimes, state) => {
+  const startedAt = Date.now();
+  return (async () => {
+    let i = frames.length;
+    while (!state.stopped) {
+      const tick = Date.now();
       const framePath = join(dir, `f-${String(i).padStart(5, "0")}.jpg`);
       try {
-        // Capture to a buffer and write atomically (tmp + rename) so ffmpeg never
-        // reads a half-written JPEG from the frame directory.
         const buf = await page.screenshot({ type: "jpeg", quality: 80, fullPage: false, timeout: 4000, animations: "allow" });
         const tmpPath = `${framePath}.tmp`;
         await writeFile(tmpPath, buf);
         await rename(tmpPath, framePath);
         frames.push(framePath);
+        frameTimes.push(Date.now() - startedAt);
         i += 1;
       } catch {
         /* ignore transient capture failures */
       }
-
-      const wait = intervalMs - (Date.now() - startedAt);
+      const wait = intervalMs - (Date.now() - tick);
       if (wait > 0) await new Promise((r) => setTimeout(r, wait));
     }
   })();
-  return { frames, stop: async () => { stopped = true; await run.catch(() => {}); } };
 };
+
+const startFrameCapture = (page, dir, intervalMs = SCENE_FRAME_INTERVAL_MS) => {
+  const frames = [];
+  const frameTimes = [];
+  const state = { stopped: false };
+  const startedAt = Date.now();
+  let session = null;
+  let writeChain = Promise.resolve();
+  let loopRun = null;
+
+  const started = (async () => {
+    try {
+      session = await page.context().newCDPSession(page);
+      let i = 0;
+      session.on("Page.screencastFrame", (frame) => {
+        // Ack immediately so Chrome keeps sending frames while we write to disk.
+        session.send("Page.screencastFrameAck", { sessionId: frame.sessionId }).catch(() => {});
+        if (state.stopped) return;
+        const elapsed = Date.now() - startedAt;
+        const framePath = join(dir, `f-${String(i).padStart(5, "0")}.jpg`);
+        i += 1;
+        writeChain = writeChain.then(async () => {
+          try {
+            const tmpPath = `${framePath}.tmp`;
+            await writeFile(tmpPath, Buffer.from(frame.data, "base64"));
+            await rename(tmpPath, framePath);
+            frames.push(framePath);
+            frameTimes.push(elapsed);
+          } catch {
+            /* ignore transient write failures */
+          }
+        });
+      });
+      await session.send("Page.startScreencast", {
+        format: "jpeg",
+        quality: 80,
+        maxWidth: 390,
+        maxHeight: 844,
+        everyNthFrame: 1,
+      });
+    } catch (e) {
+      console.warn(`[capture] screencast unavailable, falling back to screenshot loop: ${String(e).slice(0, 120)}`);
+      session = null;
+      loopRun = startScreenshotLoopCapture(page, dir, intervalMs, frames, frameTimes, state);
+    }
+  })();
+
+  return {
+    frames,
+    frameTimes,
+    stop: async () => {
+      await started.catch(() => {});
+      state.stopped = true;
+      if (session) {
+        await session.send("Page.stopScreencast").catch(() => {});
+        await writeChain.catch(() => {});
+        await session.detach().catch(() => {});
+      }
+      if (loopRun) await loopRun.catch(() => {});
+    },
+  };
+};
+
 
 // PUT a sidecar file (srt/vtt) to storage via the same signed upload flow and return the view URL.
 const uploadSidecar = async (flowId, ext, contentType, body) => {
@@ -959,6 +1038,7 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
     await capture.stop();
     if (scene) {
       scene.framePaths = capture.frames.slice();
+      scene.frameTimes = (capture.frameTimes ?? []).slice();
       scene.frameIntervalMs = SCENE_FRAME_INTERVAL_MS;
       console.log(`SCENE_FRAMES index=${scene.index} frames=${scene.framePaths.length}`);
     }
@@ -1106,12 +1186,17 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
           // every navigation. domcontentloaded + a short settle is enough;
           // real readiness gates use waitForEvent("nova:app-ready").
           await page.waitForTimeout(Math.min(600, Math.max(200, budget)));
+          // v29: animation-heavy Calm tools (canvas/WebGL) need a beat to spin
+          // their render loop up before capture starts, or the first seconds
+          // record as a frozen frame.
+          if (/sensory|calm|breath|gravity|slime|glitter|paint|bubble|aurora|star/i.test(u.pathname + u.search)) {
+            await page.waitForTimeout(Math.min(900, Math.max(300, remainingBudgetMs() || 900))).catch(() => {});
+          }
           const finalPath = (() => { try { return new URL(page.url()).pathname; } catch { return null; } })();
           lastGotoSamePath = !!(currentPath && finalPath && currentPath === finalPath);
           console.log("[recording] opened", page.url(), lastGotoSamePath ? "(same path)" : "");
         }
       } else if (step.action === "click") {
-        const selector = requireSelector(step, originalIndex >= 0 ? originalIndex : index);
         await ensureRouteForClick(page, selector, nova);
         await clickSelector(page, selector, { optional: true, timeout: 4000 });
         // After Text Chat click, confirm the chat input actually rendered.
@@ -1286,7 +1371,18 @@ const processFlow = async ({ flow, nova }) => {
   let captionsVttUrl = null;
 
   stageWithProgress(flow.id, "browser-launch");
-  const browser = await chromium.launch();
+  const browser = await chromium.launch({
+    args: [
+      // Software GL so canvas/WebGL surfaces in the Calm tools actually animate
+      // in headless Chromium instead of painting once and freezing.
+      "--use-gl=angle",
+      "--use-angle=swiftshader",
+      "--enable-unsafe-swiftshader",
+      "--disable-background-timer-throttling",
+      "--disable-renderer-backgrounding",
+      "--disable-backgrounding-occluded-windows",
+    ],
+  });
 
   // 1. Reuse the initialized demo account state between renders.
   stageWithProgress(flow.id, "auth-warmup");
@@ -1401,6 +1497,7 @@ const processFlow = async ({ flow, nova }) => {
   }
 
   if (!stepReport.scenes.length) throw new Error("no scenes captured from tutorial narration");
+
   stageWithProgress(flow.id, "assemble-scenes", `${stepReport.scenes.length} stills`);
   const sceneRecordingMs = await writeSceneVideo({ workDir, scenes: stepReport.scenes, outputPath: recordingMp4 });
 
@@ -1505,10 +1602,9 @@ const processFlow = async ({ flow, nova }) => {
   // v28: captions are ON by default and positioned inside the selected platform's
   // safe zone (see CAPTION_SAFE_ZONES). Set BURN_CAPTIONS=0 to disable burning;
   // the .srt/.vtt sidecars are uploaded either way.
-const burnCaptions = flow.burn_captions === false
-  ? false
-  : /^(1|true|yes|on)$/i.test(String(process.env.BURN_CAPTIONS ?? "1"));
-
+  const burnCaptions = flow.burn_captions === false
+    ? false
+    : /^(1|true|yes|on)$/i.test(String(process.env.BURN_CAPTIONS ?? "1"));
   if (hasNarration && burnCaptions) {
     // ffmpeg subtitles filter path escaping: escape :, ', \
     const esc = srtPath.replace(/\\/g, "\\\\").replace(/:/g, "\\:").replace(/'/g, "\\'");
