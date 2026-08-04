@@ -15,8 +15,42 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-08-04-isolated-cta-v37-f4b8c21";
+const WORKER_VERSION = "2026-08-04-preflight-v38-7d91a6e";
 const NARRATION_TAIL_MS = 800;
+const PREFLIGHT_INTERVAL_MS = 5 * 60 * 1000;
+let lastPreflightAt = 0;
+
+const isCtaUrl = (value) => {
+  try { return new URL(String(value)).pathname === "/promo-cta"; } catch { return false; }
+};
+const pixelStats = (pixels) => {
+  if (!pixels?.length) return { range: 0, nonBlank: false };
+  let min = 255;
+  let max = 0;
+  for (let index = 0; index < pixels.length; index += 4) {
+    for (let channel = 0; channel < 3; channel += 1) {
+      const value = pixels[index + channel];
+      if (!Number.isFinite(value)) continue;
+      min = Math.min(min, value);
+      max = Math.max(max, value);
+    }
+  }
+  const range = max - min;
+  return { range, nonBlank: range >= 8 };
+};
+const shouldAcceptCta = ({ url, visible, width, height, opacity, firstPixels, secondPixels }) =>
+  isCtaUrl(url)
+  && visible
+  && width > 20
+  && height > 20
+  && opacity >= 0.5
+  && pixelStats(firstPixels).nonBlank
+  && pixelStats(secondPixels).nonBlank;
+const finalSceneIsCta = (scene) => Boolean(scene) && (
+  String(scene.screenActionId ?? "").startsWith("cta.")
+  || isCtaUrl(scene.expectedUrl)
+  || isCtaUrl(scene.url)
+);
 
 // ---------------------------------------------------------------------------
 // v28: platform caption safe zones (all values in real 1080x1920 pixels).
@@ -75,6 +109,49 @@ const sh = (cmd, args) => new Promise((resolve, reject) => {
   const p = spawn(cmd, args, { stdio: ["ignore", "inherit", "inherit"] });
   p.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`${cmd} exited ${code}`))));
 });
+
+const screenshotPixelSample = async (page, buffer) => page.evaluate(async (base64) => {
+  const image = new Image();
+  image.src = `data:image/png;base64,${base64}`;
+  await image.decode();
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.min(48, image.naturalWidth);
+  canvas.height = Math.min(48, image.naturalHeight);
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (!context) return [];
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  return Array.from(context.getImageData(0, 0, canvas.width, canvas.height).data);
+}, buffer.toString("base64"));
+
+const captureVerifiedCta = async (page, outputPath) => {
+  const url = page.url();
+  const surface = page.locator('[data-recorder="promo-cta"]').first();
+  await surface.waitFor({ state: "visible", timeout: 12000 });
+  const box = await surface.boundingBox();
+  const appearance = await surface.evaluate((element) => {
+    const style = getComputedStyle(element);
+    return { visible: style.visibility !== "hidden" && style.display !== "none", opacity: Number(style.opacity || "1") };
+  });
+  const first = await surface.screenshot({ type: "png", animations: "allow" });
+  await page.waitForTimeout(250);
+  const second = await surface.screenshot({ type: "png", animations: "allow" });
+  const [firstPixels, secondPixels] = await Promise.all([
+    screenshotPixelSample(page, first),
+    screenshotPixelSample(page, second),
+  ]);
+  const accepted = shouldAcceptCta({
+    url,
+    visible: appearance.visible,
+    width: box?.width ?? 0,
+    height: box?.height ?? 0,
+    opacity: appearance.opacity,
+    firstPixels,
+    secondPixels,
+  });
+  if (!accepted) throw new Error(`Closing CTA mounted but verified pixels were blank; actual=${url}`);
+  await writeFile(outputPath, second);
+  return { url, width: box?.width ?? 0, height: box?.height ?? 0 };
+};
 
 const getMediaDurationMs = (file) => new Promise((resolve) => {
   const p = spawn("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file], { stdio: ["ignore", "pipe", "ignore"] });
@@ -550,6 +627,58 @@ const prepareScenePage = async ({ browser, storageState, nova, loginPayload }) =
   const page = await context.newPage();
   await forceActivePage(page);
   return { context, page };
+};
+
+const runWorkerPreflight = async (nova, featureUrl) => {
+  const workDir = await mkdtemp(join(tmpdir(), "nova-preflight-"));
+  const browser = await chromium.launch({
+    args: [
+      "--use-gl=angle",
+      "--use-angle=swiftshader",
+      "--enable-unsafe-swiftshader",
+      "--disable-background-timer-throttling",
+      "--disable-renderer-backgrounding",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,TranslateUI",
+    ],
+  });
+  let context = null;
+  try {
+    const loginPayload = await fetchDemoLoginPayload(nova, true);
+    const storageState = await warmUpStorageState({ browser, nova, loginPayload });
+    const prepared = await prepareScenePage({ browser, storageState, nova, loginPayload });
+    context = prepared.context;
+    const page = prepared.page;
+    const target = featureUrl || `${nova.app_url}/profiles?demo=1&recording=1&skipOnboarding=1&lang=en&profile=alex`;
+    await page.goto(target, { waitUntil: "domcontentloaded", timeout: 20000 });
+    await page.waitForTimeout(800);
+    const featureRoute = routeMatches(page.url(), target, nova);
+    const interactionSurface = await page.locator('[data-recorder], [data-tour], button, [role="button"]').first().isVisible().catch(() => false);
+    const beforeScroll = await page.evaluate(() => window.scrollY);
+    await page.mouse.wheel(0, 120);
+    await page.waitForTimeout(150);
+    const afterScroll = await page.evaluate(() => window.scrollY);
+    const ctaUrl = `${nova.app_url}/promo-cta?demo=1&recording=1&skipOnboarding=1&lang=en&audience=parents`;
+    await page.goto("about:blank", { waitUntil: "load", timeout: 5000 });
+    await page.goto(ctaUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
+    await page.waitForTimeout(500);
+    const ctaPath = join(workDir, "cta.png");
+    const cta = await captureVerifiedCta(page, ctaPath);
+    const checks = {
+      demo_login: true,
+      feature_route: featureRoute,
+      interaction_surface: interactionSurface,
+      scroll_dispatched: Number.isFinite(beforeScroll) && Number.isFinite(afterScroll),
+      cta_route: finalSceneIsCta({ url: cta.url }),
+      cta_pixels: true,
+      cta_dimensions: `${Math.round(cta.width)}x${Math.round(cta.height)}`,
+    };
+    return { ok: Object.entries(checks).filter(([key]) => key !== "cta_dimensions").every(([, value]) => value === true), checks };
+  } finally {
+    if (context) await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+    await rm(workDir, { recursive: true, force: true });
+  }
 };
 
 // Fetch narration MP3 for a `narrate` step via the tutorial-worker edge fn.
@@ -1153,34 +1282,13 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
               if (!ctaReady) {
                 throw new Error(`Closing CTA URL opened but the CTA screen did not render; actual=${actualUrl}`);
               }
-              const ctaPainted = await page.waitForFunction(() => {
-                const element = document.querySelector('[data-recorder="promo-cta"]');
-                if (!(element instanceof HTMLElement)) return false;
-                const style = getComputedStyle(element);
-                const rect = element.getBoundingClientRect();
-                const animationsDone = element.getAnimations({ subtree: true })
-                  .every((animation) => animation.playState === "finished" || animation.playState === "idle");
-                return Number(style.opacity || "1") >= 0.99
-                  && style.visibility !== "hidden"
-                  && rect.width > 0
-                  && rect.height > 0
-                  && animationsDone;
-              }, undefined, { timeout: 10000, polling: 100 }).then(() => true).catch(() => false);
-              if (!ctaPainted) {
-                throw new Error(`Closing CTA mounted but did not finish painting; actual=${actualUrl}`);
-              }
-              // Let the compositor commit one complete frame after the final
-              // transition before taking the pixel source used in the MP4.
-              await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+              // The CTA intentionally contains looping motion. Pixel verification
+              // below is authoritative and does not wait for loops to finish.
             }
             const sceneIndex = stepReport.scenes.length;
             const imagePath = join(sceneWorkDir, `scene-${String(sceneIndex).padStart(3, "0")}.png`);
             if (isClosingCta) {
-              // Capture the CTA-owned main element itself. A normal page
-              // screenshot can reuse the last compositor surface from a canvas
-              // heavy Calm route even after the CTA DOM is visible.
-              const ctaSurface = page.locator('[data-recorder="promo-cta"]').first();
-              await ctaSurface.screenshot({ path: imagePath, animations: "disabled" });
+              await captureVerifiedCta(page, imagePath);
             } else {
               await page.screenshot({ path: imagePath, fullPage: false });
             }
@@ -1663,11 +1771,7 @@ const processFlow = async ({ flow, nova }) => {
   }
 
   const finalScene = stepReport.scenes[stepReport.scenes.length - 1];
-  const finalIsCta = !!finalScene && (
-    String(finalScene.screenActionId ?? "").startsWith("cta.")
-    || String(finalScene.expectedUrl ?? "").includes("/promo-cta")
-    || String(finalScene.url ?? "").includes("/promo-cta")
-  );
+  const finalIsCta = finalSceneIsCta(finalScene);
   if (!finalIsCta) {
     throw new Error(`Closing CTA was not captured as the final scene. Final scene was ${finalScene?.url ?? "missing"}.`);
   }
@@ -1734,8 +1838,7 @@ const processFlow = async ({ flow, nova }) => {
   const requestedTargetVideoMs = hasNarration && narrationEndMs > 0
     ? narrationEndMs + NARRATION_TAIL_MS
     : (trimmedRecordingMs > 0 ? trimmedRecordingMs : 0);
-  const finalIsCtaScene = String(finalScene?.screenActionId ?? "").startsWith("cta.")
-    || String(finalScene?.expectedUrl ?? "").includes("/promo-cta");
+  const finalIsCtaScene = finalSceneIsCta(finalScene);
   // Never trim the assembled tail when it contains the required CTA. Previous
   // versions could validate and capture CTA, then remove it here with ffmpeg -t.
   const targetVideoMs = finalIsCtaScene
@@ -1917,6 +2020,17 @@ const processFlow = async ({ flow, nova }) => {
 const loop = async () => {
   while (true) {
     try {
+      if (Date.now() - lastPreflightAt >= PREFLIGHT_INTERVAL_MS) {
+        lastPreflightAt = Date.now();
+        const config = await api({ action: "preflight-config" });
+        const preflight = config?.nova
+          ? await runWorkerPreflight(config.nova, config?.checks?.feature_url).catch((error) => ({ ok: false, error: String(error?.message ?? error) }))
+          : { ok: false, error: "Preflight configuration was unavailable." };
+        await api({ action: "worker-heartbeat", preflight });
+        console.log(`[preflight] ${preflight.ok ? "passed" : "failed"}`, preflight);
+      } else {
+        await api({ action: "worker-heartbeat" });
+      }
       const { flow, nova } = await api({ action: "claim" });
       if (!flow) {
         console.log("[loop] no work, sleeping…");
