@@ -15,7 +15,7 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-08-04-cta-guarantee-v36-d91f7a2";
+const WORKER_VERSION = "2026-08-04-isolated-cta-v37-f4b8c21";
 const NARRATION_TAIL_MS = 800;
 
 // ---------------------------------------------------------------------------
@@ -255,30 +255,6 @@ const fillSelector = async (page, selector, text) => {
   await locator.waitFor({ state: "attached", timeout: 15000 });
   await locator.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
   await locator.fill(text ?? "", { timeout: 10000 });
-};
-
-const ensureRouteForClick = async (page, selector, nova) => {
-  const sel = String(selector ?? "");
-  const route = sel.includes("profile-alex") || /has-text\(["']Alex["']\)/.test(sel)
-    ? "/profiles"
-    : sel.includes("Type your message") || sel.includes("Send message") || sel.includes("Text Chat")
-      ? "/chat"
-      : sel.includes("Meltdown") || sel.includes("Elopement") || sel.includes("Wandering")
-        ? "/crisis"
-        : sel.includes("sensory-") || /Breathe|Breathing|Jar|Float|Bubble|Pop|Draw|Sand|Koi|Sound|Body Scan|Aurora/i.test(sel)
-          ? "/sensory"
-          : null;
-  if (!route) return;
-  const current = new URL(page.url()).pathname;
-  if (current === route) return;
-  const url = new URL(`${nova.app_url}${route}`);
-  url.searchParams.set("demo", "1");
-  url.searchParams.set("recording", "1");
-  url.searchParams.set("skipOnboarding", "1");
-  url.searchParams.set("lang", "en");
-  console.log(`[recording] selector implies ${route}; navigating before click`);
-  await page.goto(url.toString(), { waitUntil: "domcontentloaded", timeout: 30000 });
-  await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
 };
 
 // Every click is treated as best effort: the narration keeps playing and the
@@ -1070,8 +1046,12 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
     activeScene = null;
     await capture.stop();
     if (scene) {
+      const liveUrl = (() => { try { return page.url(); } catch { return ""; } })();
+      const ctaInDom = await page.locator('[data-recorder="promo-cta"]').first().isVisible().catch(() => false);
       const isClosingCta = scene.screenActionId?.startsWith("cta.")
-        || String(scene.expectedUrl ?? "").includes("/promo-cta");
+        || String(scene.expectedUrl ?? "").includes("/promo-cta")
+        || liveUrl.includes("/promo-cta")
+        || ctaInDom;
       // Chrome can emit a stale screencast frame from the document that was
       // open before a cross-route navigation. The CTA is a static closing
       // screen, so its verified post-navigation screenshot is the source of
@@ -1173,10 +1153,37 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
               if (!ctaReady) {
                 throw new Error(`Closing CTA URL opened but the CTA screen did not render; actual=${actualUrl}`);
               }
+              const ctaPainted = await page.waitForFunction(() => {
+                const element = document.querySelector('[data-recorder="promo-cta"]');
+                if (!(element instanceof HTMLElement)) return false;
+                const style = getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                const animationsDone = element.getAnimations({ subtree: true })
+                  .every((animation) => animation.playState === "finished" || animation.playState === "idle");
+                return Number(style.opacity || "1") >= 0.99
+                  && style.visibility !== "hidden"
+                  && rect.width > 0
+                  && rect.height > 0
+                  && animationsDone;
+              }, undefined, { timeout: 10000, polling: 100 }).then(() => true).catch(() => false);
+              if (!ctaPainted) {
+                throw new Error(`Closing CTA mounted but did not finish painting; actual=${actualUrl}`);
+              }
+              // Let the compositor commit one complete frame after the final
+              // transition before taking the pixel source used in the MP4.
+              await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
             }
             const sceneIndex = stepReport.scenes.length;
             const imagePath = join(sceneWorkDir, `scene-${String(sceneIndex).padStart(3, "0")}.png`);
-            await page.screenshot({ path: imagePath, fullPage: false });
+            if (isClosingCta) {
+              // Capture the CTA-owned main element itself. A normal page
+              // screenshot can reuse the last compositor surface from a canvas
+              // heavy Calm route even after the CTA DOM is visible.
+              const ctaSurface = page.locator('[data-recorder="promo-cta"]').first();
+              await ctaSurface.screenshot({ path: imagePath, animations: "disabled" });
+            } else {
+              await page.screenshot({ path: imagePath, fullPage: false });
+            }
             const scene = {
               index: sceneIndex,
               imagePath,
@@ -1240,6 +1247,12 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
           // can never starve the navigation that prepares the next beat.
           const budget = remainingBudgetMs();
           const gotoTimeout = Math.max(8000, Math.min(30000, budget || 30000));
+          // The closing screen must start from a clean document. Reusing the
+          // animation-heavy Calm document allowed its last canvas paint to leak
+          // into Chrome's next screencast even though the CTA DOM had passed.
+          if (u.pathname === "/promo-cta") {
+            await page.goto("about:blank", { waitUntil: "load", timeout: 5000 });
+          }
           await page.goto(url, { waitUntil: "domcontentloaded", timeout: gotoTimeout });
           // v14: don't wait for full networkidle — Nova's chat/streaming widgets
           // rarely idle within 10s, so this used to burn the full timeout on
@@ -1276,7 +1289,9 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
         }
       } else if (step.action === "click") {
         const selector = requireSelector(step, originalIndex >= 0 ? originalIndex : index);
-        await ensureRouteForClick(page, selector, nova);
+        // Never infer or change routes from selector text. The preceding goto
+        // from Nova's recorder plan is authoritative. The old heuristic sent
+        // every sensory interaction back to /sensory, causing random Calm jumps.
         const clicked = await clickSelector(page, selector, { optional: true, timeout: 6000 });
         if (!clicked) {
           // v34: a missing click target is reported but never aborts the beat.
