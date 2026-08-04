@@ -15,8 +15,9 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-08-04-ctapixels-v41-b1f4c22";
+const WORKER_VERSION = "2026-08-04-cta-tail-v42-7c18e5a";
 const NARRATION_TAIL_MS = 800;
+const CTA_TAIL_MS = 5000;
 const PREFLIGHT_INTERVAL_MS = 5 * 60 * 1000;
 let lastPreflightAt = 0;
 
@@ -128,6 +129,48 @@ const pixelSampleFromPng = (buffer) => new Promise((resolve) => {
   p.stdin.end(buffer);
 });
 
+const pngFromVideoTail = (videoPath) => new Promise((resolve, reject) => {
+  const p = spawn("ffmpeg", [
+    "-v", "error", "-sseof", "-0.2", "-i", videoPath,
+    "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1",
+  ], { stdio: ["ignore", "pipe", "pipe"] });
+  const chunks = [];
+  let error = "";
+  p.stdout.on("data", (chunk) => chunks.push(chunk));
+  p.stderr.on("data", (chunk) => { error += chunk.toString(); });
+  p.on("error", reject);
+  p.on("exit", (code) => code === 0 && chunks.length
+    ? resolve(Buffer.concat(chunks))
+    : reject(new Error(`could not extract final video frame: ${error.trim() || `ffmpeg ${code}`}`)));
+});
+
+const pixelMeanAbsoluteError = (left, right) => {
+  if (!left?.length || left.length !== right?.length) return Number.POSITIVE_INFINITY;
+  let total = 0;
+  for (let index = 0; index < left.length; index += 4) {
+    total += Math.abs(left[index] - right[index]);
+    total += Math.abs(left[index + 1] - right[index + 1]);
+    total += Math.abs(left[index + 2] - right[index + 2]);
+  }
+  return total / ((left.length / 4) * 3);
+};
+
+const verifyVideoEndsWithCta = async (videoPath, ctaReferencePath) => {
+  const [tailPng, referencePng] = await Promise.all([
+    pngFromVideoTail(videoPath),
+    readFile(ctaReferencePath),
+  ]);
+  const [tailPixels, referencePixels] = await Promise.all([
+    pixelSampleFromPng(tailPng),
+    pixelSampleFromPng(referencePng),
+  ]);
+  const meanAbsoluteError = pixelMeanAbsoluteError(tailPixels, referencePixels);
+  if (!Number.isFinite(meanAbsoluteError) || meanAbsoluteError > 24) {
+    throw new Error(`Final MP4 does not visibly end on the verified CTA (pixel difference ${Number.isFinite(meanAbsoluteError) ? meanAbsoluteError.toFixed(1) : "unavailable"}).`);
+  }
+  return { ok: true, mean_absolute_error: Number(meanAbsoluteError.toFixed(2)) };
+};
+
 const captureVerifiedCta = async (page, outputPath) => {
   const url = page.url();
   const surface = page.locator('[data-recorder="promo-cta"]').first();
@@ -164,7 +207,9 @@ const captureVerifiedCta = async (page, outputPath) => {
   if (!result.accepted) result = await attempt(() => page.screenshot({ type: "png", animations: "allow", fullPage: true }));
 
   if (!result.accepted) throw new Error(`Closing CTA mounted but verified pixels were blank; actual=${url}`);
-  await writeFile(outputPath, result.second);
+  // Always persist the complete 9:16 viewport as the assembly reference. The
+  // accepted fallback may have been only the CTA element or a tall full page.
+  await writeFile(outputPath, await page.screenshot({ type: "png", animations: "allow", fullPage: false }));
   return { url, width: box?.width ?? 0, height: box?.height ?? 0 };
 };
 
@@ -680,6 +725,19 @@ const runWorkerPreflight = async (nova, featureUrl) => {
     await page.waitForTimeout(500);
     const ctaPath = join(workDir, "cta.png");
     const cta = await captureVerifiedCta(page, ctaPath);
+    const featurePath = join(workDir, "feature.png");
+    const assembledPath = join(workDir, "preflight-tail.mp4");
+    await page.goto(target, { waitUntil: "domcontentloaded", timeout: 20000 });
+    await writeFile(featurePath, await page.screenshot({ type: "png", fullPage: false }));
+    await writeSceneVideo({
+      workDir,
+      scenes: [
+        { imagePath: featurePath, durationMs: 500 },
+        { imagePath: ctaPath, durationMs: 1200 },
+      ],
+      outputPath: assembledPath,
+    });
+    const assembledTail = await verifyVideoEndsWithCta(assembledPath, ctaPath);
     const checks = {
       demo_login: true,
       feature_route: featureRoute,
@@ -687,6 +745,7 @@ const runWorkerPreflight = async (nova, featureUrl) => {
       scroll_dispatched: Number.isFinite(beforeScroll) && Number.isFinite(afterScroll),
       cta_route: finalSceneIsCta({ url: cta.url }),
       cta_pixels: true,
+      assembled_cta_tail: assembledTail.ok,
       cta_dimensions: `${Math.round(cta.width)}x${Math.round(cta.height)}`,
     };
     return { ok: Object.entries(checks).filter(([key]) => key !== "cta_dimensions").every(([, value]) => value === true), checks };
@@ -868,6 +927,35 @@ const normalizeVideoDuration = async ({ inputPath, outputPath, durationMs, loop 
   );
   await sh("ffmpeg", args);
   return getMediaDurationMs(outputPath);
+};
+
+const writeCtaTailVideo = async ({ imagePath, outputPath, durationMs = CTA_TAIL_MS }) => {
+  const seconds = Math.max(1, durationMs / 1000).toFixed(3);
+  await sh("ffmpeg", [
+    "-y", "-loop", "1", "-framerate", "30", "-i", imagePath,
+    "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+    "-t", seconds,
+    "-vf", "scale=390:844:force_original_aspect_ratio=increase,crop=390:844,format=yuv420p,setpts=PTS-STARTPTS",
+    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-shortest",
+    outputPath,
+  ]);
+};
+
+const appendCtaTail = async ({ featureVideoPath, ctaVideoPath, outputPath, featureHasAudio }) => {
+  const args = ["-y", "-i", featureVideoPath, "-i", ctaVideoPath];
+  if (featureHasAudio) {
+    args.push(
+      "-filter_complex", "[0:v]fps=30,format=yuv420p[v0];[1:v]fps=30,format=yuv420p[v1];[v0][0:a][v1][1:a]concat=n=2:v=1:a=1[v][a]",
+      "-map", "[v]", "-map", "[a]", "-c:a", "aac", "-b:a", "192k",
+    );
+  } else {
+    args.push(
+      "-filter_complex", "[0:v]fps=30,format=yuv420p[v0];[1:v]fps=30,format=yuv420p[v1];[v0][v1]concat=n=2:v=1:a=0[v]",
+      "-map", "[v]", "-an",
+    );
+  }
+  args.push("-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", outputPath);
+  await sh("ffmpeg", args);
 };
 
 const concatFileLine = (file) => `file '${String(file).replace(/'/g, "'\\''")}'`;
@@ -1681,6 +1769,9 @@ const processFlow = async ({ flow, nova }) => {
   const normalizedRecordingMp4 = join(workDir, "recording-normalized.mp4");
   const normalizedMascotMp4 = join(workDir, "mascot-normalized.mp4");
   const compositedPath = join(workDir, "composited.mp4");
+  const finalWithCtaPath = join(workDir, "final-with-cta.mp4");
+  const isolatedCtaPath = join(workDir, "isolated-cta.png");
+  const ctaTailPath = join(workDir, "cta-tail.mp4");
   const mascotIsImage = !!flow.mascot_is_image || /\.(png|jpe?g|webp|gif)(\?|$)/i.test(flow.mascot_url || "");
   const mascotExt = mascotIsImage ? (flow.mascot_url.match(/\.(png|jpe?g|webp|gif)/i)?.[0] || ".png") : ".mp4";
   const mascotPath = join(workDir, `mascot${mascotExt}`);
@@ -1748,7 +1839,7 @@ const processFlow = async ({ flow, nova }) => {
   // The final video is assembled from these stills, each held for the measured
   // narration duration. No live page timing can freeze or drift under the audio.
   stageWithProgress(flow.id, "scene-capture-start", `${flowScript.length} script steps`);
-  const { context, page } = await prepareScenePage({ browser, storageState, nova, loginPayload });
+  let { context, page } = await prepareScenePage({ browser, storageState, nova, loginPayload });
   let scriptStartedAt = Date.now();
 
   let prepOk = false;
@@ -1774,6 +1865,19 @@ const processFlow = async ({ flow, nova }) => {
       cachedNovaLoginPayloadAt = 0;
       throw new Error("scene capture started on the language picker instead of an initialized Nova session");
     }
+    const plannedCtaScene = [...stepReport.scenes].reverse().find((scene) => finalSceneIsCta(scene));
+    if (!plannedCtaScene?.url || !isCtaUrl(plannedCtaScene.url)) {
+      throw new Error("The recorder plan did not provide a canonical final CTA URL.");
+    }
+    await context.close();
+    const isolated = await prepareScenePage({ browser, storageState, nova, loginPayload });
+    context = isolated.context;
+    page = isolated.page;
+    await page.goto("about:blank", { waitUntil: "load", timeout: 5000 });
+    await page.goto(plannedCtaScene.url, { waitUntil: "domcontentloaded", timeout: 20000 });
+    await page.waitForTimeout(500);
+    await captureVerifiedCta(page, isolatedCtaPath);
+    console.log(`[recording] isolated CTA captured ${page.url()}`);
   } finally {
     await context.close();
     await browser.close();
@@ -1797,6 +1901,9 @@ const processFlow = async ({ flow, nova }) => {
   if (!finalIsCta) {
     throw new Error(`Closing CTA was not captured as the final scene. Final scene was ${finalScene?.url ?? "missing"}.`);
   }
+  // The CTA is not a normal narration scene. It is appended after the fully
+  // normalized feature video so no audio clock or stale browser frame can trim it.
+  stepReport.scenes = stepReport.scenes.filter((scene) => !finalSceneIsCta(scene));
 
   stageWithProgress(flow.id, "all-scenes-approved", `${stepReport.scenes.length} screens ready`);
   const scenesByStep = new Map(stepReport.scenes.map((scene) => [scene.stepIndex, scene]));
@@ -1860,12 +1967,7 @@ const processFlow = async ({ flow, nova }) => {
   const requestedTargetVideoMs = hasNarration && narrationEndMs > 0
     ? narrationEndMs + NARRATION_TAIL_MS
     : (trimmedRecordingMs > 0 ? trimmedRecordingMs : 0);
-  const finalIsCtaScene = finalSceneIsCta(finalScene);
-  // Never trim the assembled tail when it contains the required CTA. Previous
-  // versions could validate and capture CTA, then remove it here with ffmpeg -t.
-  const targetVideoMs = finalIsCtaScene
-    ? Math.max(requestedTargetVideoMs, trimmedRecordingMs)
-    : requestedTargetVideoMs;
+  const targetVideoMs = requestedTargetVideoMs;
   let baseRecordingMp4 = recordingMp4;
   if (targetVideoMs > 0) {
     const padMs = targetVideoMs - trimmedRecordingMs;
@@ -1991,23 +2093,25 @@ const processFlow = async ({ flow, nova }) => {
   ffArgs.push("-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", compositedPath);
   stageWithProgress(flow.id, "compositing", `mascot=${mascotIdx >= 0} narration=${hasNarration}`);
   await sh("ffmpeg", ffArgs);
-  const finalVideoMs = await getMediaDurationMs(compositedPath);
-  if (finalIsCtaScene && finalVideoMs + 250 < scenesTotalMs) {
-    throw new Error(`final video may be missing the CTA: final=${finalVideoMs}ms scenes=${scenesTotalMs}ms`);
-  }
+  stageWithProgress(flow.id, "append-verified-cta", `${CTA_TAIL_MS / 1000}s isolated tail`);
+  await writeCtaTailVideo({ imagePath: isolatedCtaPath, outputPath: ctaTailPath });
+  await appendCtaTail({ featureVideoPath: compositedPath, ctaVideoPath: ctaTailPath, outputPath: finalWithCtaPath, featureHasAudio: hasNarration });
+  const ctaTailVerification = await verifyVideoEndsWithCta(finalWithCtaPath, isolatedCtaPath);
+  const finalVideoMs = await getMediaDurationMs(finalWithCtaPath);
   console.warn(`TIMING_REPORT flow=${flow.id} worker=${WORKER_VERSION} narration_track_ms=${narrationTrackMs} narration_clock_ms=${narrationClockMs} target_ms=${targetVideoMs} recording_ms=${trimmedRecordingMs} final_ms=${finalVideoMs}`);
   console.log(`[timing] final=${finalVideoMs}ms target=${targetVideoMs}ms`);
-  if (targetVideoMs > 0 && finalVideoMs + 250 < targetVideoMs) {
-    throw new Error(`final video cut short: final=${finalVideoMs}ms target=${targetVideoMs}ms`);
+  const finalTargetMs = targetVideoMs + CTA_TAIL_MS;
+  if (targetVideoMs > 0 && finalVideoMs + 250 < finalTargetMs) {
+    throw new Error(`final video cut short: final=${finalVideoMs}ms target=${finalTargetMs}ms`);
   }
-  if (targetVideoMs > 0 && finalVideoMs > targetVideoMs + 1500) {
-    throw new Error(`final video exceeded narration clock: final=${finalVideoMs}ms target=${targetVideoMs}ms`);
+  if (targetVideoMs > 0 && finalVideoMs > finalTargetMs + 1500) {
+    throw new Error(`final video exceeded feature plus CTA clock: final=${finalVideoMs}ms target=${finalTargetMs}ms`);
   }
 
   // 4. Upload the final composite.
   stageWithProgress(flow.id, "upload-final-mp4");
   const { uploadUrl, viewUrl } = await api({ action: "getUploadUrl", id: flow.id, ext: "mp4" });
-  const buf = await readFile(compositedPath);
+  const buf = await readFile(finalWithCtaPath);
   const upRes = await fetch(uploadUrl, {
     method: "PUT",
     headers: { "content-type": "video/mp4" },
@@ -2032,6 +2136,7 @@ const processFlow = async ({ flow, nova }) => {
       ok: scene.ok,
     })),
     worker_version: WORKER_VERSION,
+    cta_tail: { duration_ms: CTA_TAIL_MS, ...ctaTailVerification },
   };
 
   await rm(workDir, { recursive: true, force: true });
