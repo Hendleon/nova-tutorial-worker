@@ -15,7 +15,7 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-08-04-preflight-v38-7d91a6e";
+const WORKER_VERSION = "2026-08-04-audit-v39-b82f4c1";
 const NARRATION_TAIL_MS = 800;
 const PREFLIGHT_INTERVAL_MS = 5 * 60 * 1000;
 let lastPreflightAt = 0;
@@ -1032,7 +1032,13 @@ const uploadSidecar = async (flowId, ext, contentType, body) => {
 };
 
 const normalizeScriptSteps = (script) => {
-  const mapped = (script || []).map((step, originalIndex) => ({ step, originalIndex }));
+  const mapped = (script || [])
+    .map((step, originalIndex) => ({ step, originalIndex }))
+    .filter(({ step, originalIndex }) => {
+      const valid = step && typeof step.action === "string" && step.action.length > 0;
+      if (!valid) console.warn(`[recording] dropping malformed step ${originalIndex}: missing action`);
+      return valid;
+    });
   const out = [];
   let skippedAutologin = false;
 
