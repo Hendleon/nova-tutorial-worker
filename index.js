@@ -15,7 +15,7 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-08-04-nova-authoritative-v35-c8e42f1";
+const WORKER_VERSION = "2026-08-04-cta-guarantee-v36-d91f7a2";
 const NARRATION_TAIL_MS = 800;
 
 // ---------------------------------------------------------------------------
@@ -1259,6 +1259,20 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
           // which is what let the freeze reappear on the 2nd/3rd scene even
           // after the initial page load was forced active.
           await forceActivePage(page);
+          if (u.pathname === "/promo-cta") {
+            const ctaReady = await page.waitForFunction(
+              () => Boolean(
+                window.__nova?.ctaReady === true
+                || document.documentElement.dataset.novaCtaReady === "1"
+                || document.querySelector('[data-recorder="promo-cta"]'),
+              ),
+              undefined,
+              { timeout: 12000 },
+            ).then(() => true).catch(() => false);
+            if (!ctaReady) throw new Error(`CTA page opened but never signalled readiness: ${page.url()}`);
+            await page.waitForTimeout(300);
+            console.log(`[recording] CTA_READY url=${page.url()}`);
+          }
         }
       } else if (step.action === "click") {
         const selector = requireSelector(step, originalIndex >= 0 ? originalIndex : index);
@@ -1411,7 +1425,18 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
         // v15: query-param-only navigations do not emit a fresh route-ready event
         // in Nova. A waitForEvent("nova:route-ready") after such a goto would burn
         // its full timeout and create a long silent gap. Treat it as satisfied.
-        if (event === "nova:route-ready" && lastGotoSamePath) {
+        if (event === "nova:cta-ready") {
+          const ready = await page.waitForFunction(
+            () => Boolean(
+              window.__nova?.ctaReady === true
+              || document.documentElement.dataset.novaCtaReady === "1"
+              || document.querySelector('[data-recorder="promo-cta"]'),
+            ),
+            undefined,
+            { timeout },
+          ).then(() => true).catch(() => false);
+          if (!ready) throw new Error("nova:cta-ready was not observed");
+        } else if (event === "nova:route-ready" && lastGotoSamePath) {
           console.log(`[recording] route-ready skipped (same-path navigation)`);
           lastGotoSamePath = false;
         } else {
