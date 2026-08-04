@@ -15,7 +15,7 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-08-04-cta-tail-v42-7c18e5a";
+const WORKER_VERSION = "2026-08-05-tight-tail-1080-v43-4b2f9d1";
 const NARRATION_TAIL_MS = 800;
 const CTA_TAIL_MS = 5000;
 const PREFLIGHT_INTERVAL_MS = 5 * 60 * 1000;
@@ -63,6 +63,10 @@ const finalSceneIsCta = (scene) => Boolean(scene) && (
 // ---------------------------------------------------------------------------
 const CAPTION_FRAME_W = 1080;
 const CAPTION_FRAME_H = 1920;
+// v43: the final MP4 is assembled at true 1080x1920 so the safe-zone margins
+// above are real output pixels (capture stays at 390x844 for smooth animation).
+const OUT_W = CAPTION_FRAME_W;
+const OUT_H = CAPTION_FRAME_H;
 const CAPTION_SAFE_ZONES = {
   // Bottom strip ~29% (555px) + right rail 20% -> sit captions at ~600px up,
   // shifted left of the engagement column.
@@ -912,14 +916,17 @@ const writeTimedNarrationTrack = async ({ workDir, narrationTimeline, narrationM
   return true;
 };
 
-const normalizeVideoDuration = async ({ inputPath, outputPath, durationMs, loop = false }) => {
+const normalizeVideoDuration = async ({ inputPath, outputPath, durationMs, loop = false, scaleToOutput = false }) => {
   const durationSec = Math.max(0.1, durationMs / 1000).toFixed(3);
+  const scaleFilter = scaleToOutput
+    ? `scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase:flags=lanczos,crop=${OUT_W}:${OUT_H},`
+    : "";
   const args = ["-y"];
   if (loop) args.push("-stream_loop", "-1");
   args.push(
     "-i", inputPath,
     "-t", durationSec,
-    "-vf", "fps=30,format=yuv420p,setpts=PTS-STARTPTS",
+    "-vf", `fps=30,${scaleFilter}format=yuv420p,setpts=PTS-STARTPTS`,
     "-an",
     "-c:v", "libx264",
     "-pix_fmt", "yuv420p",
@@ -929,21 +936,32 @@ const normalizeVideoDuration = async ({ inputPath, outputPath, durationMs, loop 
   return getMediaDurationMs(outputPath);
 };
 
-const writeCtaTailVideo = async ({ imagePath, outputPath, durationMs = CTA_TAIL_MS }) => {
+const writeCtaTailVideo = async ({ imagePath, outputPath, durationMs = CTA_TAIL_MS, audioPath = null }) => {
   const seconds = Math.max(1, durationMs / 1000).toFixed(3);
-  await sh("ffmpeg", [
-    "-y", "-loop", "1", "-framerate", "30", "-i", imagePath,
-    "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+  const args = ["-y", "-loop", "1", "-framerate", "30", "-i", imagePath];
+  if (audioPath) args.push("-i", audioPath);
+  else args.push("-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo");
+  args.push(
     "-t", seconds,
-    "-vf", "scale=390:844:force_original_aspect_ratio=increase,crop=390:844,format=yuv420p,setpts=PTS-STARTPTS",
+    "-vf", `scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase:flags=lanczos,crop=${OUT_W}:${OUT_H},format=yuv420p,setpts=PTS-STARTPTS`,
+    "-af", "apad",
     "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-shortest",
     outputPath,
-  ]);
+  );
+  await sh("ffmpeg", args);
 };
 
-const appendCtaTail = async ({ featureVideoPath, ctaVideoPath, outputPath, featureHasAudio }) => {
+const appendCtaTail = async ({ featureVideoPath, ctaVideoPath, outputPath, featureHasAudio, ctaHasAudio = true }) => {
   const args = ["-y", "-i", featureVideoPath, "-i", ctaVideoPath];
-  if (featureHasAudio) {
+  if (!featureHasAudio && ctaHasAudio) {
+    // Silent feature track plus a spoken CTA: synthesize silence for part one so
+    // the closing line survives the concat.
+    args.push(
+      "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+      "-filter_complex", "[0:v]fps=30,format=yuv420p[v0];[1:v]fps=30,format=yuv420p[v1];[2:a]atrim=0:9999[a0];[v0][a0][v1][1:a]concat=n=2:v=1:a=1[v][a]",
+      "-map", "[v]", "-map", "[a]", "-c:a", "aac", "-b:a", "192k",
+    );
+  } else if (featureHasAudio) {
     args.push(
       "-filter_complex", "[0:v]fps=30,format=yuv420p[v0];[1:v]fps=30,format=yuv420p[v1];[v0][0:a][v1][1:a]concat=n=2:v=1:a=1[v][a]",
       "-map", "[v]", "-map", "[a]", "-c:a", "aac", "-b:a", "192k",
@@ -1016,7 +1034,7 @@ const writeSceneVideo = async ({ workDir, scenes, outputPath }) => {
     "-f", "concat",
     "-safe", "0",
     "-i", listPath,
-    "-vf", "fps=30,scale=390:844:force_original_aspect_ratio=increase,crop=390:844,format=yuv420p,setpts=PTS-STARTPTS",
+    "-vf", `fps=30,scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase:flags=lanczos,crop=${OUT_W}:${OUT_H},format=yuv420p,setpts=PTS-STARTPTS`,
     "-an",
     "-c:v", "libx264",
     "-pix_fmt", "yuv420p",
@@ -1770,6 +1788,7 @@ const processFlow = async ({ flow, nova }) => {
   const normalizedMascotMp4 = join(workDir, "mascot-normalized.mp4");
   const compositedPath = join(workDir, "composited.mp4");
   const finalWithCtaPath = join(workDir, "final-with-cta.mp4");
+  const captionedPath = join(workDir, "final-captioned.mp4");
   const isolatedCtaPath = join(workDir, "isolated-cta.png");
   const ctaTailPath = join(workDir, "cta-tail.mp4");
   const mascotIsImage = !!flow.mascot_is_image || /\.(png|jpe?g|webp|gif)(\?|$)/i.test(flow.mascot_url || "");
@@ -1903,7 +1922,16 @@ const processFlow = async ({ flow, nova }) => {
   }
   // The CTA is not a normal narration scene. It is appended after the fully
   // normalized feature video so no audio clock or stale browser frame can trim it.
+  const ctaStepIndex = Number.isFinite(finalScene?.stepIndex) ? finalScene.stepIndex : Number.POSITIVE_INFINITY;
   stepReport.scenes = stepReport.scenes.filter((scene) => !finalSceneIsCta(scene));
+
+  // v43: the closing line is spoken over the CTA tail, not over the last feature
+  // screen. Keeping it in the feature track was what left a long silent gap
+  // between the final screen and the CTA card.
+  const ctaNarrationMap = narrationMap.filter((n) => n.stepIndex >= ctaStepIndex);
+  narrationMap = narrationMap.filter((n) => n.stepIndex < ctaStepIndex);
+  narrationClockMs = applyContinuousNarrationTimeline(narrationMap);
+  applyContinuousNarrationTimeline(ctaNarrationMap);
 
   stageWithProgress(flow.id, "all-scenes-approved", `${stepReport.scenes.length} screens ready`);
   const scenesByStep = new Map(stepReport.scenes.map((scene) => [scene.stepIndex, scene]));
@@ -1936,17 +1964,20 @@ const processFlow = async ({ flow, nova }) => {
   if (narrationMap.length > 0) {
     stageWithProgress(flow.id, "narration-timeline", `${narrationMap.length} segments`);
     hasNarration = await writeTimedNarrationTrack({ workDir, narrationTimeline: narrationMap, narrationMp3 });
+  }
 
-    // Build + persist SRT/VTT sidecars aligned to the actual narration timeline.
-    const { srt, vtt } = buildCaptions(narrationMap);
-    await writeFile(srtPath, srt);
-    await writeFile(vttPath, vtt);
-    try {
-      captionsSrtUrl = await uploadSidecar(flow.id, "srt", "application/x-subrip", srt);
-      captionsVttUrl = await uploadSidecar(flow.id, "vtt", "text/vtt", vtt);
-      console.log(`[captions] uploaded srt+vtt sidecars`);
-    } catch (e) {
-      console.error("[captions] sidecar upload failed, continuing with burn only", e);
+  // Closing line audio lives in its own track so the CTA tail lasts exactly as
+  // long as Nova needs to say it, with no trailing silence before or after.
+  let ctaNarrationMp3 = null;
+  let ctaNarrationMs = 0;
+  if (ctaNarrationMap.length) {
+    const ctaAudioDir = join(workDir, "cta-audio");
+    await mkdir(ctaAudioDir, { recursive: true });
+    const candidate = join(ctaAudioDir, "cta-narration.mp3");
+    const wrote = await writeTimedNarrationTrack({ workDir: ctaAudioDir, narrationTimeline: ctaNarrationMap, narrationMp3: candidate });
+    if (wrote) {
+      ctaNarrationMp3 = candidate;
+      ctaNarrationMs = await getMediaDurationMs(candidate);
     }
   }
 
@@ -1968,6 +1999,27 @@ const processFlow = async ({ flow, nova }) => {
     ? narrationEndMs + NARRATION_TAIL_MS
     : (trimmedRecordingMs > 0 ? trimmedRecordingMs : 0);
   const targetVideoMs = requestedTargetVideoMs;
+  const ctaTailMs = ctaNarrationMs > 0
+    ? Math.min(12000, Math.max(3000, ctaNarrationMs + 1200))
+    : CTA_TAIL_MS;
+
+  if (narrationMap.length || ctaNarrationMap.length) {
+    const captionTimeline = [
+      ...narrationMap,
+      ...ctaNarrationMap.map((n) => ({ ...n, startMs: targetVideoMs + (n.startMs ?? 0) })),
+    ];
+    const { srt, vtt } = buildCaptions(captionTimeline);
+    await writeFile(srtPath, srt);
+    await writeFile(vttPath, vtt);
+    try {
+      captionsSrtUrl = await uploadSidecar(flow.id, "srt", "application/x-subrip", srt);
+      captionsVttUrl = await uploadSidecar(flow.id, "vtt", "text/vtt", vtt);
+      console.log(`[captions] uploaded srt+vtt sidecars`);
+    } catch (e) {
+      console.error("[captions] sidecar upload failed, continuing with burn only", e);
+    }
+  }
+
   let baseRecordingMp4 = recordingMp4;
   if (targetVideoMs > 0) {
     const padMs = targetVideoMs - trimmedRecordingMs;
@@ -1987,6 +2039,7 @@ const processFlow = async ({ flow, nova }) => {
       outputPath: normalizedRecordingMp4,
       durationMs: targetVideoMs,
       loop: false,
+      scaleToOutput: true,
     });
     baseRecordingMp4 = normalizedRecordingMp4;
     console.log(`[timing] narration=${narrationEndMs}ms recording=${trimmedRecordingMs}ms target=${targetVideoMs}ms normalized_recording=${normalizedBaseMs}ms`);
@@ -2061,21 +2114,6 @@ const processFlow = async ({ flow, nova }) => {
   const burnCaptions = flow.burn_captions === false
     ? false
     : /^(1|true|yes|on)$/i.test(String(process.env.BURN_CAPTIONS ?? "1"));
-  if (hasNarration && burnCaptions) {
-    // ffmpeg subtitles filter path escaping: escape :, ', \
-    const esc = srtPath.replace(/\\/g, "\\\\").replace(/:/g, "\\:").replace(/'/g, "\\'");
-    const p = CAPTION_PRESET;
-    const fontSize = Number(process.env.CAPTION_FONT_SIZE || p.fontSize);
-    const marginV = Number(process.env.CAPTION_MARGIN_V || p.marginV);
-    const style = `FontName=DejaVu Sans,FontSize=${fontSize},PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,BorderStyle=1,Outline=3,Shadow=0,Alignment=${p.alignment},MarginV=${marginV},MarginL=${p.marginL},MarginR=${p.marginR},Bold=1`;
-    // original_size pins libass to the real 1080x1920 frame so margins are true pixels
-    // (without it libass assumes 384px-tall script res and margins get multiplied ~5x,
-    //  which is what pushed captions to the top of frame before v28).
-    filterParts.push(`${videoLabel}subtitles='${esc}':original_size=${CAPTION_FRAME_W}x${CAPTION_FRAME_H}:force_style='${style}'[vsub]`);
-    videoLabel = "[vsub]";
-    console.log(`[captions] platform=${captionPlatform} align=${p.alignment} marginV=${marginV} font=${fontSize}`);
-  }
-
   if (filterParts.length) {
     ffArgs.push("-filter_complex", filterParts.join(";"));
     ffArgs.push("-map", videoLabel);
@@ -2093,14 +2131,33 @@ const processFlow = async ({ flow, nova }) => {
   ffArgs.push("-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", compositedPath);
   stageWithProgress(flow.id, "compositing", `mascot=${mascotIdx >= 0} narration=${hasNarration}`);
   await sh("ffmpeg", ffArgs);
-  stageWithProgress(flow.id, "append-verified-cta", `${CTA_TAIL_MS / 1000}s isolated tail`);
-  await writeCtaTailVideo({ imagePath: isolatedCtaPath, outputPath: ctaTailPath });
-  await appendCtaTail({ featureVideoPath: compositedPath, ctaVideoPath: ctaTailPath, outputPath: finalWithCtaPath, featureHasAudio: hasNarration });
+  stageWithProgress(flow.id, "append-verified-cta", `${(ctaTailMs / 1000).toFixed(1)}s isolated tail`);
+  await writeCtaTailVideo({ imagePath: isolatedCtaPath, outputPath: ctaTailPath, durationMs: ctaTailMs, audioPath: ctaNarrationMp3 });
+  await appendCtaTail({ featureVideoPath: compositedPath, ctaVideoPath: ctaTailPath, outputPath: finalWithCtaPath, featureHasAudio: hasNarration, ctaHasAudio: Boolean(ctaNarrationMp3) });
+  // v43: captions are burned AFTER the CTA tail is appended so the closing line
+  // is captioned too, and so libass draws onto the real 1080x1920 output frame.
+  let deliverablePath = finalWithCtaPath;
+  if (burnCaptions && (hasNarration || ctaNarrationMs > 0)) {
+    const esc = srtPath.replace(/\\/g, "\\\\").replace(/:/g, "\\:").replace(/'/g, "\\'");
+    const p = CAPTION_PRESET;
+    const fontSize = Number(process.env.CAPTION_FONT_SIZE || p.fontSize);
+    const marginV = Number(process.env.CAPTION_MARGIN_V || p.marginV);
+    const style = `FontName=DejaVu Sans,FontSize=${fontSize},PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,BorderStyle=1,Outline=3,Shadow=0,Alignment=${p.alignment},MarginV=${marginV},MarginL=${p.marginL},MarginR=${p.marginR},Bold=1`;
+    stageWithProgress(flow.id, "burn-captions", `${captionPlatform} safe zone`);
+    await sh("ffmpeg", [
+      "-y", "-i", finalWithCtaPath,
+      "-vf", `subtitles='${esc}':original_size=${OUT_W}x${OUT_H}:force_style='${style}'`,
+      "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart",
+      captionedPath,
+    ]);
+    deliverablePath = captionedPath;
+    console.log(`[captions] burned platform=${captionPlatform} align=${p.alignment} marginV=${marginV} font=${fontSize} frame=${OUT_W}x${OUT_H}`);
+  }
   const ctaTailVerification = await verifyVideoEndsWithCta(finalWithCtaPath, isolatedCtaPath);
-  const finalVideoMs = await getMediaDurationMs(finalWithCtaPath);
+  const finalVideoMs = await getMediaDurationMs(deliverablePath);
   console.warn(`TIMING_REPORT flow=${flow.id} worker=${WORKER_VERSION} narration_track_ms=${narrationTrackMs} narration_clock_ms=${narrationClockMs} target_ms=${targetVideoMs} recording_ms=${trimmedRecordingMs} final_ms=${finalVideoMs}`);
   console.log(`[timing] final=${finalVideoMs}ms target=${targetVideoMs}ms`);
-  const finalTargetMs = targetVideoMs + CTA_TAIL_MS;
+  const finalTargetMs = targetVideoMs + ctaTailMs;
   if (targetVideoMs > 0 && finalVideoMs + 250 < finalTargetMs) {
     throw new Error(`final video cut short: final=${finalVideoMs}ms target=${finalTargetMs}ms`);
   }
@@ -2111,7 +2168,7 @@ const processFlow = async ({ flow, nova }) => {
   // 4. Upload the final composite.
   stageWithProgress(flow.id, "upload-final-mp4");
   const { uploadUrl, viewUrl } = await api({ action: "getUploadUrl", id: flow.id, ext: "mp4" });
-  const buf = await readFile(finalWithCtaPath);
+  const buf = await readFile(deliverablePath);
   const upRes = await fetch(uploadUrl, {
     method: "PUT",
     headers: { "content-type": "video/mp4" },
@@ -2136,7 +2193,7 @@ const processFlow = async ({ flow, nova }) => {
       ok: scene.ok,
     })),
     worker_version: WORKER_VERSION,
-    cta_tail: { duration_ms: CTA_TAIL_MS, ...ctaTailVerification },
+    cta_tail: { duration_ms: ctaTailMs, narration_ms: ctaNarrationMs, ...ctaTailVerification },
   };
 
   await rm(workDir, { recursive: true, force: true });
