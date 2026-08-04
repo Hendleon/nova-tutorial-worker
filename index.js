@@ -15,7 +15,7 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-08-05-tight-tail-1080-v43-4b2f9d1";
+const WORKER_VERSION = "2026-08-05-ffmpeg-diag-v44-7c1a204";
 const NARRATION_TAIL_MS = 800;
 const CTA_TAIL_MS = 5000;
 const PREFLIGHT_INTERVAL_MS = 5 * 60 * 1000;
@@ -111,9 +111,23 @@ const api = async (body) => {
 };
 
 const sh = (cmd, args) => new Promise((resolve, reject) => {
-  const p = spawn(cmd, args, { stdio: ["ignore", "inherit", "inherit"] });
-  p.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`${cmd} exited ${code}`))));
+  // v44: keep the last chunk of stderr so a failure reports WHY ffmpeg exited,
+  // instead of the useless "ffmpeg exited 1".
+  const p = spawn(cmd, args, { stdio: ["ignore", "inherit", "pipe"] });
+  let tail = "";
+  p.stderr.on("data", (chunk) => {
+    const text = chunk.toString();
+    process.stderr.write(text);
+    tail = (tail + text).slice(-4000);
+  });
+  p.on("error", reject);
+  p.on("exit", (code) => {
+    if (code === 0) return resolve();
+    const lines = tail.split("\n").map((l) => l.trim()).filter(Boolean).slice(-6).join(" | ");
+    reject(new Error(`${cmd} exited ${code}${lines ? `: ${lines}` : ""}`));
+  });
 });
+
 
 // Pixel sampling runs OUTSIDE the browser. Sampling inside the page needed a
 // data: URL <img>, which Nova's CSP can block, making a perfectly painted CTA
@@ -952,29 +966,39 @@ const writeCtaTailVideo = async ({ imagePath, outputPath, durationMs = CTA_TAIL_
 };
 
 const appendCtaTail = async ({ featureVideoPath, ctaVideoPath, outputPath, featureHasAudio, ctaHasAudio = true }) => {
+  // v44: every branch normalizes scale/sar/fps and audio format before concat.
+  // Mismatched SAR or sample rate is the classic cause of "ffmpeg exited 1" here.
+  const vChain = `fps=30,scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase:flags=lanczos,crop=${OUT_W}:${OUT_H},setsar=1,format=yuv420p`;
+  const aChain = "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,asetpts=PTS-STARTPTS";
   const args = ["-y", "-i", featureVideoPath, "-i", ctaVideoPath];
   if (!featureHasAudio && ctaHasAudio) {
-    // Silent feature track plus a spoken CTA: synthesize silence for part one so
-    // the closing line survives the concat.
+    // Silent feature track plus a spoken CTA: synthesize silence for part one,
+    // trimmed to the feature's real length (an untrimmed anullsrc is infinite
+    // and used to produce a multi-hour file).
+    const featureMs = await getMediaDurationMs(featureVideoPath);
+    const silenceSec = Math.max(0.1, featureMs / 1000).toFixed(3);
     args.push(
-      "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-      "-filter_complex", "[0:v]fps=30,format=yuv420p[v0];[1:v]fps=30,format=yuv420p[v1];[2:a]atrim=0:9999[a0];[v0][a0][v1][1:a]concat=n=2:v=1:a=1[v][a]",
+      "-f", "lavfi", "-t", silenceSec, "-i", "anullsrc=r=44100:cl=stereo",
+      "-filter_complex",
+      `[0:v]${vChain}[v0];[1:v]${vChain}[v1];[2:a]${aChain}[a0];[1:a]${aChain}[a1];[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]`,
       "-map", "[v]", "-map", "[a]", "-c:a", "aac", "-b:a", "192k",
     );
   } else if (featureHasAudio) {
     args.push(
-      "-filter_complex", "[0:v]fps=30,format=yuv420p[v0];[1:v]fps=30,format=yuv420p[v1];[v0][0:a][v1][1:a]concat=n=2:v=1:a=1[v][a]",
+      "-filter_complex",
+      `[0:v]${vChain}[v0];[1:v]${vChain}[v1];[0:a]${aChain}[a0];[1:a]${aChain}[a1];[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]`,
       "-map", "[v]", "-map", "[a]", "-c:a", "aac", "-b:a", "192k",
     );
   } else {
     args.push(
-      "-filter_complex", "[0:v]fps=30,format=yuv420p[v0];[1:v]fps=30,format=yuv420p[v1];[v0][v1]concat=n=2:v=1:a=0[v]",
+      "-filter_complex", `[0:v]${vChain}[v0];[1:v]${vChain}[v1];[v0][v1]concat=n=2:v=1:a=0[v]`,
       "-map", "[v]", "-an",
     );
   }
   args.push("-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", outputPath);
   await sh("ffmpeg", args);
 };
+
 
 const concatFileLine = (file) => `file '${String(file).replace(/'/g, "'\\''")}'`;
 
@@ -2137,22 +2161,29 @@ const processFlow = async ({ flow, nova }) => {
   // v43: captions are burned AFTER the CTA tail is appended so the closing line
   // is captioned too, and so libass draws onto the real 1080x1920 output frame.
   let deliverablePath = finalWithCtaPath;
-  if (burnCaptions && (hasNarration || ctaNarrationMs > 0)) {
+  const srtText = await readFile(srtPath, "utf8").catch(() => "");
+  if (burnCaptions && srtText.trim() && (hasNarration || ctaNarrationMs > 0)) {
     const esc = srtPath.replace(/\\/g, "\\\\").replace(/:/g, "\\:").replace(/'/g, "\\'");
     const p = CAPTION_PRESET;
     const fontSize = Number(process.env.CAPTION_FONT_SIZE || p.fontSize);
     const marginV = Number(process.env.CAPTION_MARGIN_V || p.marginV);
     const style = `FontName=DejaVu Sans,FontSize=${fontSize},PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,BorderStyle=1,Outline=3,Shadow=0,Alignment=${p.alignment},MarginV=${marginV},MarginL=${p.marginL},MarginR=${p.marginR},Bold=1`;
     stageWithProgress(flow.id, "burn-captions", `${captionPlatform} safe zone`);
-    await sh("ffmpeg", [
-      "-y", "-i", finalWithCtaPath,
-      "-vf", `subtitles='${esc}':original_size=${OUT_W}x${OUT_H}:force_style='${style}'`,
-      "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart",
-      captionedPath,
-    ]);
-    deliverablePath = captionedPath;
-    console.log(`[captions] burned platform=${captionPlatform} align=${p.alignment} marginV=${marginV} font=${fontSize} frame=${OUT_W}x${OUT_H}`);
+    try {
+      await sh("ffmpeg", [
+        "-y", "-i", finalWithCtaPath,
+        "-vf", `subtitles='${esc}':original_size=${OUT_W}x${OUT_H}:force_style='${style}'`,
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart",
+        captionedPath,
+      ]);
+      deliverablePath = captionedPath;
+      console.log(`[captions] burned platform=${captionPlatform} align=${p.alignment} marginV=${marginV} font=${fontSize} frame=${OUT_W}x${OUT_H}`);
+    } catch (e) {
+      // v44: a caption failure must never destroy a finished video.
+      console.error("[captions] burn failed, delivering uncaptioned video", e);
+    }
   }
+
   const ctaTailVerification = await verifyVideoEndsWithCta(finalWithCtaPath, isolatedCtaPath);
   const finalVideoMs = await getMediaDurationMs(deliverablePath);
   console.warn(`TIMING_REPORT flow=${flow.id} worker=${WORKER_VERSION} narration_track_ms=${narrationTrackMs} narration_clock_ms=${narrationClockMs} target_ms=${targetVideoMs} recording_ms=${trimmedRecordingMs} final_ms=${finalVideoMs}`);
