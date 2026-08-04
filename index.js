@@ -15,7 +15,7 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-08-04-ctapixels-v40-9ad31e7";
+const WORKER_VERSION = "2026-08-04-ctapixels-v41-b1f4c22";
 const NARRATION_TAIL_MS = 800;
 const PREFLIGHT_INTERVAL_MS = 5 * 60 * 1000;
 let lastPreflightAt = 0;
@@ -110,21 +110,23 @@ const sh = (cmd, args) => new Promise((resolve, reject) => {
   p.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`${cmd} exited ${code}`))));
 });
 
-const screenshotPixelSample = async (page, buffer) => page.evaluate(async (base64) => {
-  const image = new Image();
-  image.src = `data:image/png;base64,${base64}`;
-  await image.decode();
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.min(64, image.naturalWidth || 64);
-  canvas.height = Math.min(64, image.naturalHeight || 64);
-  const context = canvas.getContext("2d", { willReadFrequently: true });
-  if (!context) return [];
-  // Scale the WHOLE screenshot down. Drawing at native size would only sample
-  // the top-left corner, which is usually flat background and reads as blank.
-  context.drawImage(image, 0, 0, image.naturalWidth, image.naturalHeight, 0, 0, canvas.width, canvas.height);
-  return Array.from(context.getImageData(0, 0, canvas.width, canvas.height).data);
-}, buffer.toString("base64"));
-
+// Pixel sampling runs OUTSIDE the browser. Sampling inside the page needed a
+// data: URL <img>, which Nova's CSP can block, making a perfectly painted CTA
+// look "blank". ffmpeg decodes the PNG locally and never lies.
+const pixelSampleFromPng = (buffer) => new Promise((resolve) => {
+  const p = spawn("ffmpeg", [
+    "-v", "error",
+    "-f", "image2pipe", "-i", "pipe:0",
+    "-vf", "scale=48:48",
+    "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1",
+  ], { stdio: ["pipe", "pipe", "ignore"] });
+  const chunks = [];
+  p.stdout.on("data", (chunk) => chunks.push(chunk));
+  p.on("error", () => resolve([]));
+  p.on("exit", () => resolve(Array.from(Buffer.concat(chunks))));
+  p.stdin.on("error", () => {});
+  p.stdin.end(buffer);
+});
 
 const captureVerifiedCta = async (page, outputPath) => {
   const url = page.url();
@@ -135,13 +137,6 @@ const captureVerifiedCta = async (page, outputPath) => {
     const style = getComputedStyle(element);
     return { visible: style.visibility !== "hidden" && style.display !== "none", opacity: Number(style.opacity || "1") };
   });
-  let first = await surface.screenshot({ type: "png", animations: "allow" });
-  await page.waitForTimeout(250);
-  let second = await surface.screenshot({ type: "png", animations: "allow" });
-  let [firstPixels, secondPixels] = await Promise.all([
-    screenshotPixelSample(page, first),
-    screenshotPixelSample(page, second),
-  ]);
   const check = (fp, sp) => shouldAcceptCta({
     url,
     visible: appearance.visible,
@@ -151,24 +146,28 @@ const captureVerifiedCta = async (page, outputPath) => {
     firstPixels: fp,
     secondPixels: sp,
   });
-  let accepted = check(firstPixels, secondPixels);
-  if (!accepted) {
-    // Element screenshot can come back flat on some compositor paths.
-    // Fall back to the viewport screenshot before failing the render.
-    first = await page.screenshot({ type: "png", animations: "allow" });
-    await page.waitForTimeout(250);
-    second = await page.screenshot({ type: "png", animations: "allow" });
-    [firstPixels, secondPixels] = await Promise.all([
-      screenshotPixelSample(page, first),
-      screenshotPixelSample(page, second),
-    ]);
-    accepted = check(firstPixels, secondPixels);
-  }
-  if (!accepted) throw new Error(`Closing CTA mounted but verified pixels were blank; actual=${url}`);
-  await writeFile(outputPath, second);
-  return { url, width: box?.width ?? 0, height: box?.height ?? 0 };
 
+  const attempt = async (shot) => {
+    const first = await shot();
+    await page.waitForTimeout(250);
+    const second = await shot();
+    const [firstPixels, secondPixels] = await Promise.all([
+      pixelSampleFromPng(first),
+      pixelSampleFromPng(second),
+    ]);
+    return { accepted: check(firstPixels, secondPixels), second };
+  };
+
+  // 1) element screenshot, 2) viewport screenshot, 3) full-page screenshot.
+  let result = await attempt(() => surface.screenshot({ type: "png", animations: "allow" }));
+  if (!result.accepted) result = await attempt(() => page.screenshot({ type: "png", animations: "allow" }));
+  if (!result.accepted) result = await attempt(() => page.screenshot({ type: "png", animations: "allow", fullPage: true }));
+
+  if (!result.accepted) throw new Error(`Closing CTA mounted but verified pixels were blank; actual=${url}`);
+  await writeFile(outputPath, result.second);
+  return { url, width: box?.width ?? 0, height: box?.height ?? 0 };
 };
+
 
 const getMediaDurationMs = (file) => new Promise((resolve) => {
   const p = spawn("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file], { stdio: ["ignore", "pipe", "ignore"] });
