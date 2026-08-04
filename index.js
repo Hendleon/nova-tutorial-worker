@@ -15,7 +15,7 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-08-04-audit-v39-b82f4c1";
+const WORKER_VERSION = "2026-08-04-ctapixels-v40-9ad31e7";
 const NARRATION_TAIL_MS = 800;
 const PREFLIGHT_INTERVAL_MS = 5 * 60 * 1000;
 let lastPreflightAt = 0;
@@ -115,13 +115,16 @@ const screenshotPixelSample = async (page, buffer) => page.evaluate(async (base6
   image.src = `data:image/png;base64,${base64}`;
   await image.decode();
   const canvas = document.createElement("canvas");
-  canvas.width = Math.min(48, image.naturalWidth);
-  canvas.height = Math.min(48, image.naturalHeight);
+  canvas.width = Math.min(64, image.naturalWidth || 64);
+  canvas.height = Math.min(64, image.naturalHeight || 64);
   const context = canvas.getContext("2d", { willReadFrequently: true });
   if (!context) return [];
-  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  // Scale the WHOLE screenshot down. Drawing at native size would only sample
+  // the top-left corner, which is usually flat background and reads as blank.
+  context.drawImage(image, 0, 0, image.naturalWidth, image.naturalHeight, 0, 0, canvas.width, canvas.height);
   return Array.from(context.getImageData(0, 0, canvas.width, canvas.height).data);
 }, buffer.toString("base64"));
+
 
 const captureVerifiedCta = async (page, outputPath) => {
   const url = page.url();
@@ -132,25 +135,39 @@ const captureVerifiedCta = async (page, outputPath) => {
     const style = getComputedStyle(element);
     return { visible: style.visibility !== "hidden" && style.display !== "none", opacity: Number(style.opacity || "1") };
   });
-  const first = await surface.screenshot({ type: "png", animations: "allow" });
+  let first = await surface.screenshot({ type: "png", animations: "allow" });
   await page.waitForTimeout(250);
-  const second = await surface.screenshot({ type: "png", animations: "allow" });
-  const [firstPixels, secondPixels] = await Promise.all([
+  let second = await surface.screenshot({ type: "png", animations: "allow" });
+  let [firstPixels, secondPixels] = await Promise.all([
     screenshotPixelSample(page, first),
     screenshotPixelSample(page, second),
   ]);
-  const accepted = shouldAcceptCta({
+  const check = (fp, sp) => shouldAcceptCta({
     url,
     visible: appearance.visible,
     width: box?.width ?? 0,
     height: box?.height ?? 0,
     opacity: appearance.opacity,
-    firstPixels,
-    secondPixels,
+    firstPixels: fp,
+    secondPixels: sp,
   });
+  let accepted = check(firstPixels, secondPixels);
+  if (!accepted) {
+    // Element screenshot can come back flat on some compositor paths.
+    // Fall back to the viewport screenshot before failing the render.
+    first = await page.screenshot({ type: "png", animations: "allow" });
+    await page.waitForTimeout(250);
+    second = await page.screenshot({ type: "png", animations: "allow" });
+    [firstPixels, secondPixels] = await Promise.all([
+      screenshotPixelSample(page, first),
+      screenshotPixelSample(page, second),
+    ]);
+    accepted = check(firstPixels, secondPixels);
+  }
   if (!accepted) throw new Error(`Closing CTA mounted but verified pixels were blank; actual=${url}`);
   await writeFile(outputPath, second);
   return { url, width: box?.width ?? 0, height: box?.height ?? 0 };
+
 };
 
 const getMediaDurationMs = (file) => new Promise((resolve) => {
