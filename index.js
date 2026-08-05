@@ -15,8 +15,7 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-08-05-ffmpeg-diag-v44-7c1a204";
-const NARRATION_TAIL_MS = 800;
+const WORKER_VERSION = "2026-08-05-zero-gap-hooks-v45-3f8c2d1";
 const CTA_TAIL_MS = 5000;
 const PREFLIGHT_INTERVAL_MS = 5 * 60 * 1000;
 let lastPreflightAt = 0;
@@ -2011,16 +2010,21 @@ const processFlow = async ({ flow, nova }) => {
 
   const narrationTrackMs = hasNarration ? await getMediaDurationMs(narrationMp3) : 0;
   const scenesTotalMs = stepReport.scenes.reduce((sum, scene) => sum + scene.durationMs, 0);
+  const mappedNarrationEndMs = narrationMap.reduce(
+    (max, n) => Math.max(max, (Number.isFinite(n.startMs) ? n.startMs : 0) + n.durationMs),
+    0,
+  );
   const narrationEndMs = Math.max(
     narrationTrackMs,
-    narrationMap.reduce((max, n) => Math.max(max, (Number.isFinite(n.startMs) ? n.startMs : 0) + n.durationMs), 0),
-    scenesTotalMs,
+    mappedNarrationEndMs,
   );
   const trimmedRecordingMs = sceneRecordingMs || await getMediaDurationMs(recordingMp4);
   // v19: narration is the authoritative clock. Scenes are already assembled to
   // the same per-line durations, then trimmed or padded to the narration tail.
+  // v45: the feature clip ends on the measured feature narration. Minimum scene
+  // holds only govern visual allocation and must never delay the isolated CTA.
   const requestedTargetVideoMs = hasNarration && narrationEndMs > 0
-    ? narrationEndMs + NARRATION_TAIL_MS
+    ? narrationEndMs
     : (trimmedRecordingMs > 0 ? trimmedRecordingMs : 0);
   const targetVideoMs = requestedTargetVideoMs;
   const ctaTailMs = ctaNarrationMs > 0
@@ -2186,7 +2190,8 @@ const processFlow = async ({ flow, nova }) => {
 
   const ctaTailVerification = await verifyVideoEndsWithCta(finalWithCtaPath, isolatedCtaPath);
   const finalVideoMs = await getMediaDurationMs(deliverablePath);
-  console.warn(`TIMING_REPORT flow=${flow.id} worker=${WORKER_VERSION} narration_track_ms=${narrationTrackMs} narration_clock_ms=${narrationClockMs} target_ms=${targetVideoMs} recording_ms=${trimmedRecordingMs} final_ms=${finalVideoMs}`);
+  const measuredTransitionGapMs = Math.max(0, targetVideoMs - narrationEndMs);
+  console.warn(`TIMING_REPORT flow=${flow.id} worker=${WORKER_VERSION} narration_track_ms=${narrationTrackMs} narration_clock_ms=${narrationClockMs} mapped_narration_end_ms=${mappedNarrationEndMs} scene_allocation_ms=${scenesTotalMs} feature_video_end_ms=${targetVideoMs} cta_start_ms=${targetVideoMs} transition_gap_ms=${measuredTransitionGapMs} recording_ms=${trimmedRecordingMs} final_ms=${finalVideoMs}`);
   console.log(`[timing] final=${finalVideoMs}ms target=${targetVideoMs}ms`);
   const finalTargetMs = targetVideoMs + ctaTailMs;
   if (targetVideoMs > 0 && finalVideoMs + 250 < finalTargetMs) {
