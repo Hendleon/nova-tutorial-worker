@@ -15,7 +15,7 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-08-05-zero-gap-hooks-v45-3f8c2d1";
+const WORKER_VERSION = "2026-08-06-frame-timing-v46-7b21e4c";
 const CTA_TAIL_MS = 5000;
 const PREFLIGHT_INTERVAL_MS = 5 * 60 * 1000;
 let lastPreflightAt = 0;
@@ -1005,10 +1005,30 @@ const concatFileLine = (file) => `file '${String(file).replace(/'/g, "'\\''")}'`
 // animations actually happen. Frames play at real speed; if the burst is shorter
 // than the spoken line, the last frame freezes for the remainder. If it is
 // longer, frames are evenly compressed into the narration window.
+const MIN_FRAME_MS = 40; // v46: sub-frame durations produce an invalid input
+// framerate for the concat demuxer, which makes libx264 refuse to open
+// ("Error while opening encoder ... maybe incorrect parameters such as
+// bit_rate, rate, width or height"). Never emit a frame shorter than this.
+
+const sanitizeFrameEntries = (entries) => {
+  const out = [];
+  for (const entry of entries) {
+    const ms = Number.isFinite(entry.ms) ? entry.ms : MIN_FRAME_MS;
+    if (ms < MIN_FRAME_MS && out.length) {
+      // Fold the too-short frame into the previous one instead of writing a
+      // zero-length entry.
+      out[out.length - 1].ms += Math.max(0, ms);
+      continue;
+    }
+    out.push({ file: entry.file, ms: Math.max(MIN_FRAME_MS, ms) });
+  }
+  return out;
+};
+
 const writeSceneVideo = async ({ workDir, scenes, outputPath }) => {
   if (!scenes.length) throw new Error("no deterministic scenes captured");
   const listPath = join(workDir, "scenes.txt");
-  const lines = [];
+  const entries = [];
   let lastFile = null;
   for (const scene of scenes) {
     const targetMs = Math.max(500, scene.durationMs);
@@ -1016,8 +1036,7 @@ const writeSceneVideo = async ({ workDir, scenes, outputPath }) => {
     const intervalMs = scene.frameIntervalMs ?? SCENE_FRAME_INTERVAL_MS;
     const times = Array.isArray(scene.frameTimes) && scene.frameTimes.length === frames.length ? scene.frameTimes : null;
     if (frames.length === 1) {
-      lines.push(concatFileLine(frames[0]));
-      lines.push(`duration ${(targetMs / 1000).toFixed(3)}`);
+      entries.push({ file: frames[0], ms: targetMs });
     } else if (times) {
       // Real per-frame timing from the screencast. Scale to fit the spoken line:
       // stretch the tail when capture was short, compress evenly when it ran long.
@@ -1026,45 +1045,47 @@ const writeSceneVideo = async ({ workDir, scenes, outputPath }) => {
       const scale = realMs > targetMs ? targetMs / realMs : 1;
       const durations = raw.map((ms) => ms * scale);
       if (realMs < targetMs) durations[durations.length - 1] += targetMs - realMs;
-      frames.forEach((file, i) => {
-        lines.push(concatFileLine(file));
-        lines.push(`duration ${(durations[i] / 1000).toFixed(3)}`);
-      });
+      frames.forEach((file, i) => entries.push({ file, ms: durations[i] }));
     } else {
       const realMs = frames.length * intervalMs;
       if (realMs <= targetMs) {
         // Real-time playback, then hold the final frame to fill the spoken line.
         const tailMs = targetMs - realMs + intervalMs;
-        frames.forEach((file, i) => {
-          lines.push(concatFileLine(file));
-          lines.push(`duration ${(((i === frames.length - 1 ? tailMs : intervalMs)) / 1000).toFixed(3)}`);
-        });
+        frames.forEach((file, i) => entries.push({ file, ms: i === frames.length - 1 ? tailMs : intervalMs }));
       } else {
         const per = targetMs / frames.length;
-        for (const file of frames) {
-          lines.push(concatFileLine(file));
-          lines.push(`duration ${(per / 1000).toFixed(3)}`);
-        }
+        for (const file of frames) entries.push({ file, ms: per });
       }
     }
     lastFile = frames[frames.length - 1];
   }
+  const safe = sanitizeFrameEntries(entries);
+  if (!safe.length) throw new Error("no usable scene frames after sanitizing durations");
+  const lines = [];
+  for (const entry of safe) {
+    lines.push(concatFileLine(entry.file));
+    lines.push(`duration ${(entry.ms / 1000).toFixed(3)}`);
+  }
   // concat demuxer needs the final image repeated or the last duration is ignored.
-  lines.push(concatFileLine(lastFile));
+  lines.push(concatFileLine(lastFile ?? safe[safe.length - 1].file));
   await writeFile(listPath, lines.join("\n"));
   await sh("ffmpeg", [
     "-y",
+    "-nostdin",
     "-f", "concat",
     "-safe", "0",
     "-i", listPath,
     "-vf", `fps=30,scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase:flags=lanczos,crop=${OUT_W}:${OUT_H},format=yuv420p,setpts=PTS-STARTPTS`,
+    "-r", "30",
     "-an",
     "-c:v", "libx264",
+    "-preset", "veryfast",
     "-pix_fmt", "yuv420p",
     outputPath,
   ]);
   return getMediaDurationMs(outputPath);
 };
+
 
 // v29: capture through the Chrome DevTools screencast so frames arrive as the
 // page actually paints (25-30 fps) instead of a 10 fps screenshot loop that
