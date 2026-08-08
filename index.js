@@ -15,7 +15,7 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-08-06-frame-timing-v46-7b21e4c";
+const WORKER_VERSION = "2026-08-08-font-safe-v47-3c19d2a";
 const CTA_TAIL_MS = 5000;
 const PREFLIGHT_INTERVAL_MS = 5 * 60 * 1000;
 let lastPreflightAt = 0;
@@ -188,8 +188,44 @@ const verifyVideoEndsWithCta = async (videoPath, ctaReferencePath) => {
   return { ok: true, mean_absolute_error: Number(meanAbsoluteError.toFixed(2)) };
 };
 
+// Playwright's screenshot blocks on document.fonts.ready. Nova pages that keep a
+// font request pending stall it until the default 30s timeout, which surfaced as
+// "page.screenshot: Timeout 30000ms exceeded ... waiting for fonts to load".
+// Capture with a short timeout and fall back to a raw CDP frame that never waits
+// on fonts.
+const cdpScreenshot = async (page, { format = "png", quality } = {}) => {
+  const session = await page.context().newCDPSession(page);
+  try {
+    const params = { format, captureBeyondViewport: false, fromSurface: true };
+    if (format === "jpeg" && quality) params.quality = quality;
+    const { data } = await session.send("Page.captureScreenshot", params);
+    return Buffer.from(data, "base64");
+  } finally {
+    await session.detach().catch(() => {});
+  }
+};
+
+const safeScreenshot = async (page, options = {}, timeout = 8000) => {
+  try {
+    return await page.screenshot({ ...options, timeout });
+  } catch (e) {
+    console.warn(`[capture] page.screenshot fell back to CDP: ${String(e).slice(0, 140)}`);
+    return await cdpScreenshot(page, { format: options.type === "jpeg" ? "jpeg" : "png", quality: options.quality });
+  }
+};
+
+const safeElementScreenshot = async (locator, options = {}, timeout = 8000) => {
+  try {
+    return await locator.screenshot({ ...options, timeout });
+  } catch (e) {
+    console.warn(`[capture] element screenshot failed: ${String(e).slice(0, 140)}`);
+    return null;
+  }
+};
+
 const captureVerifiedCta = async (page, outputPath) => {
   const url = page.url();
+
   const surface = page.locator('[data-recorder="promo-cta"]').first();
   await surface.waitFor({ state: "visible", timeout: 12000 });
   const box = await surface.boundingBox();
@@ -209,8 +245,9 @@ const captureVerifiedCta = async (page, outputPath) => {
 
   const attempt = async (shot) => {
     const first = await shot();
+    if (!first) return { accepted: false, second: null };
     await page.waitForTimeout(250);
-    const second = await shot();
+    const second = (await shot()) || first;
     const [firstPixels, secondPixels] = await Promise.all([
       pixelSampleFromPng(first),
       pixelSampleFromPng(second),
@@ -219,14 +256,14 @@ const captureVerifiedCta = async (page, outputPath) => {
   };
 
   // 1) element screenshot, 2) viewport screenshot, 3) full-page screenshot.
-  let result = await attempt(() => surface.screenshot({ type: "png", animations: "allow" }));
-  if (!result.accepted) result = await attempt(() => page.screenshot({ type: "png", animations: "allow" }));
-  if (!result.accepted) result = await attempt(() => page.screenshot({ type: "png", animations: "allow", fullPage: true }));
+  let result = await attempt(() => safeElementScreenshot(surface, { type: "png", animations: "allow" }));
+  if (!result.accepted) result = await attempt(() => safeScreenshot(page, { type: "png", animations: "allow" }));
+  if (!result.accepted) result = await attempt(() => safeScreenshot(page, { type: "png", animations: "allow", fullPage: true }));
 
   if (!result.accepted) throw new Error(`Closing CTA mounted but verified pixels were blank; actual=${url}`);
   // Always persist the complete 9:16 viewport as the assembly reference. The
   // accepted fallback may have been only the CTA element or a tall full page.
-  await writeFile(outputPath, await page.screenshot({ type: "png", animations: "allow", fullPage: false }));
+  await writeFile(outputPath, await safeScreenshot(page, { type: "png", animations: "allow", fullPage: false }));
   return { url, width: box?.width ?? 0, height: box?.height ?? 0 };
 };
 
@@ -745,7 +782,7 @@ const runWorkerPreflight = async (nova, featureUrl) => {
     const featurePath = join(workDir, "feature.png");
     const assembledPath = join(workDir, "preflight-tail.mp4");
     await page.goto(target, { waitUntil: "domcontentloaded", timeout: 20000 });
-    await writeFile(featurePath, await page.screenshot({ type: "png", fullPage: false }));
+    await writeFile(featurePath, await safeScreenshot(page, { type: "png", fullPage: false }));
     await writeSceneVideo({
       workDir,
       scenes: [
@@ -1100,7 +1137,7 @@ const startScreenshotLoopCapture = (page, dir, intervalMs, frames, frameTimes, s
       const tick = Date.now();
       const framePath = join(dir, `${prefix}-${String(i).padStart(5, "0")}.jpg`);
       try {
-        const buf = await page.screenshot({ type: "jpeg", quality: 80, fullPage: false, timeout: 4000, animations: "allow" });
+        const buf = await safeScreenshot(page, { type: "jpeg", quality: 80, fullPage: false, animations: "allow" }, 4000);
         const tmpPath = `${framePath}.tmp`;
         await writeFile(tmpPath, buf);
         await rename(tmpPath, framePath);
@@ -1462,7 +1499,7 @@ const runScript = async (page, script, nova, narrationMap, timelineBaseMs = Date
             if (isClosingCta) {
               await captureVerifiedCta(page, imagePath);
             } else {
-              await page.screenshot({ path: imagePath, fullPage: false });
+              await writeFile(imagePath, await safeScreenshot(page, { type: "png", fullPage: false }));
             }
             const scene = {
               index: sceneIndex,
