@@ -15,8 +15,8 @@ const {
   POLL_INTERVAL_MS = "10000",
 } = process.env;
 
-const WORKER_VERSION = "2026-08-08-cta-tolerant-v48-9f41b7c";
-const CTA_TAIL_MS = 5000;
+const WORKER_VERSION = "2026-08-09-retention-tail-v49-3c7ad21";
+const CTA_TAIL_MS = 3000;
 const PREFLIGHT_INTERVAL_MS = 5 * 60 * 1000;
 let lastPreflightAt = 0;
 
@@ -2100,7 +2100,7 @@ const processFlow = async ({ flow, nova }) => {
     : (trimmedRecordingMs > 0 ? trimmedRecordingMs : 0);
   const targetVideoMs = requestedTargetVideoMs;
   const ctaTailMs = ctaNarrationMs > 0
-    ? Math.min(12000, Math.max(3000, ctaNarrationMs + 1200))
+    ? Math.min(12000, Math.max(1500, ctaNarrationMs + 400))
     : CTA_TAIL_MS;
 
   if (narrationMap.length || ctaNarrationMap.length) {
